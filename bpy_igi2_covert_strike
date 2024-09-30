@@ -1,0 +1,4241 @@
+bl_info = {
+    "name": "MEF Importer",
+    "blender": (2, 82, 0),
+    "category": "Import-Export",
+    "author": "Your Name",
+    "version": (1, 0),
+    "description": "Import MEF files into Blender.",
+    "warning": "",  # Any warnings or notes
+    "wiki_url": "",  # Link to documentation or wiki
+    "tracker_url": "",  # Link to bug tracker
+    "support": 'COMMUNITY',  # Community support type
+}
+
+RUN_AS_ADDON = True  # Change to True to run as an addon
+
+from pathlib import Path  # Needed for os stuff
+import random
+import struct  # Needed for Binary Reader
+import math
+import bpy
+import mathutils  # this i'm guessing is a branch of the bpy module specifically for math operations
+from mathutils import Vector
+import os
+
+# Globals, Don't Touch These
+signed, unsigned = 0, 1  # Enums for read function
+seek_set, seek_cur, seek_end = 0, 1, 2  # Enums for seek function
+SEEK_ABS, SEEK_REL, SEEK_CUR, SEEK_END = 0, 1, 1, 2  # Enums for seek function
+
+on, off = True, False
+
+
+def format(text="", args=[]):
+    # prints in blender are annoying this is a hack so i don't have to keep explicitly denoting the type
+    ns = ""
+    i = 0
+    if len(text) > 1 and text[len(text) - 1:len(text)] == "\n":
+        text = text[0:-1]
+
+    isArr = (type(args).__name__ == "tuple" or type(args).__name__ == "list")
+
+    if isArr == True and len(args) > 0:
+        for s in text:
+            t = s
+            if s == "%":
+                if i < len(args):
+                    t = str(args[i])
+                elif i == 0:
+                    t = str(args)
+                else:
+                    t = ""
+                i = i + 1
+            ns = ns + t
+        print(ns)
+    elif text.find("%") > -1:
+        for s in text:
+            t = s
+            if s == "%":
+                if i == 0:
+                    t = str(args)
+                else:
+                    t = ""
+                i = i + 1
+            ns = ns + t
+        print(ns)
+    else:
+        print(text)
+    return None
+
+
+def subString(s, start=0, end=-1, base=1):
+    # base is a starting index of 1 as used in maxscript
+    start -= base
+    if start < 0: start = 0
+    if end > -1:
+        end += start
+    else:
+        end = len(s)
+    return s[start:end:1]
+
+
+def matchPattern(s="", pattern="", ignoreCase=True):
+    # This is a hack, this does not function the same as in maxscript
+    isfound = False
+    pattern = pattern.replace('*', '')
+    if ignoreCase:
+        if s.lower().find(pattern.lower()) != -1: isfound = True
+    else:
+        if s.find(pattern) != -1: isfound = True
+    return isfound
+
+
+def as_filename(name):  # could reuse for other presets
+    # AFAICT is for, as the name suggests storing a filename.
+    # Filenames cannot contain certain characters.
+    # It doesn't appear to in anyway auto-parse.
+    # The Paint Palettes addon uses the subtype for preset file names.
+    # The following method is used to parse out illegal / invalid chars.
+    for char in " !@#$%^&*(){}:\";'[]<>,.\\/?":
+        name = name.replace(char, '_')
+    return name.lower().strip()
+
+
+def rancol4():
+    return (random.uniform(0.0, 1.0), random.uniform(0.0, 1.0), random.uniform(0.0, 1.0), 1.0)
+
+
+def rancol3():
+    return (random.uniform(0.0, 1.0), random.uniform(0.0, 1.0), random.uniform(0.0, 1.0))
+
+
+def ceil(num):
+    n = float(int(num))
+    if num > n: n += 1.0
+    return n
+
+
+def cross(vec1=(0.0, 0.0, 0.0), vec2=(0.0, 0.0, 0.0)):
+    return (
+        vec2[1] * vec1[2] - vec2[2] * vec1[1],
+        vec2[2] * vec1[0] - vec2[0] * vec1[2],
+        vec2[0] * vec1[1] - vec2[1] * vec1[0]
+    )
+
+
+def dot(a=(0.0, 0.0, 0.0), b=(0.0, 0.0, 0.0)):
+    return sum(map(lambda pair: pair[0] * pair[1], zip(a, b)))
+
+
+def abs(val=0.0):
+    # return (-val if val < 0 else val)
+    return math.abs(val)
+
+
+def sqrt(n=0.0, l=0.001):
+    # x = n
+    # root = 0.0
+    # count = 0
+    # while True:
+    #    count += 1
+    #    if x == 0: break
+    #    root = 0.5 * (x + (n / x))
+    #    if abs(root - x) < l: break
+    #    x = root
+    # return root
+    return math.sqrt(n)
+
+
+def normalize(vec=(0.0, 0.0, 0.0)):
+    div = sqrt((vec[0] * vec[0]) + (vec[1] * vec[1]) + (vec[2] * vec[2]))
+    return (
+        (vec[0] / div) if vec[0] != 0 else 0.0,
+        (vec[1] / div) if vec[1] != 0 else 0.0,
+        (vec[2] / div) if vec[2] != 0 else 0.0
+    )
+
+
+def max(val1=0.0, val2=0.0):
+    return val1 if val1 > val2 else val2
+
+
+def distance(vec1=(0.0, 0.0, 0.0), vec2=(0.0, 0.0, 0.0)):
+    return (sqrt((pow(vec2[0] - vec1[0], 2)) + (pow(vec2[1] - vec1[1], 2)) + (pow(vec2[2] - vec1[2], 2))))
+
+
+def radToDeg(radian):
+    # return (radian * 57.295779513082320876798154814105170332405472466564)
+    return math.degrees(radian)
+
+
+def degToRad(degree):
+    # return (degree * 0.017453292519943295769236907684886127134428718885417)
+    return math.radians(degree)
+
+
+class bit:
+    def And(integer1, integer2): return (integer1 & integer2)
+
+    def Or(integer1, integer2): return (integer1 | integer2)
+
+    def Xor(integer1, integer2): return (integer1 ^ integer2)
+
+    def Not(integer1): return (~integer1)
+
+    def Get(integer1, integer2): return ((integer1 & (1 << integer2)) >> integer2)
+
+    def Set(integer1, integer2, boolean): return (
+                integer1 ^ ((integer1 * 0 - (int(boolean))) ^ integer1) & ((integer1 * 0 + 1) << integer2))
+
+    def Shift(integer1, integer2): return ((integer1 >> -integer2) if integer2 < 0 else (integer1 << integer2))
+
+    def CharAsInt(string): return ord(str(string))
+
+    def IntAsChar(integer): return chr(int(integer))
+
+    def IntAsHex(integer): return format(integer, 'X')
+
+    def IntAsFloat(integer): return struct.unpack('f', integer.to_bytes(4, byteorder='little'))
+
+
+def delete(objName):
+    select(objName)
+    bpy.ops.object.delete(use_global=False)
+
+
+def delete_all():
+    for obj in bpy.context.scene.objects:
+        bpy.data.objects.remove(obj, do_unlink=True)
+    return None
+
+
+class LayerProperties:
+    layer = None
+
+    def __init__(self, name=""):
+        self.layer = bpy.data.collections.get(name)
+
+    def addNode(self, obj=None):
+        result = False
+        if obj != None and self.layer != None:
+
+            # Loop through all collections the obj is linked to
+            for col in obj.users_collection:
+                # Unlink the object
+                col.objects.unlink(obj)
+
+            # Link each object to the target collection
+            self.layer.objects.link(obj)
+            result = True
+        return result
+
+
+class LayerManager:
+
+    def getLayerFromName(name=""):
+        col = bpy.data.collections.get(name)
+        result = None
+        if col: result = LayerProperties(col.name)
+        return result
+
+    def newLayerFromName(name=""):
+        col = bpy.data.collections.new(name)
+        col.name = name
+        bpy.context.scene.collection.children.link(col)
+        bpy.context.view_layer.update()
+        return LayerProperties(col.name)
+
+
+class dummy:
+    object = None
+
+    def __init__(self, position=(0.0, 0.0, 0.0)):
+        self.object = bpy.data.objects.new("Empty", None)
+        bpy.context.scene.collection.objects.link(self.object)
+        self.object.empty_display_size = 1
+        self.object.empty_display_type = 'CUBE'
+        self.object.location = position
+
+    def position(self, pos=(0.0, 0.0, 0.0)):
+        if self.object != None: self.object.location = pos
+
+    def name(self, name=""):
+        if self.object != None and name != "": self.object.name = name
+
+    def showLinks(self, enable=False):
+        return enable
+
+    def showLinksOnly(self, enable=False):
+        return enable
+
+
+class matrix3:
+    row1 = [1.0, 0.0, 0.0]
+    row2 = [0.0, 1.0, 0.0]
+    row3 = [0.0, 0.0, 1.0]
+    row4 = [0.0, 0.0, 0.0]
+
+    def __init__(self, rowA=[1.0, 0.0, 0.0], rowB=[0.0, 1.0, 0.0], rowC=[0.0, 0.0, 1.0], rowD=[0.0, 0.0, 0.0]):
+        if rowA == 0:
+            self.row1 = [0.0, 0.0, 0.0]
+            self.row2 = [0.0, 0.0, 0.0]
+            self.row3 = [0.0, 0.0, 0.0]
+
+        elif rowA == 1:
+            self.row1 = [1.0, 0.0, 0.0]
+            self.row2 = [0.0, 1.0, 0.0]
+            self.row3 = [0.0, 0.0, 1.0]
+            self.row4 = [0.0, 0.0, 0.0]
+        else:
+            self.row1 = rowA
+            self.row2 = rowB
+            self.row3 = rowC
+            self.row4 = rowD
+
+    def __repr__(self):
+        return (
+                "matrix3([" + str(self.row1[0]) +
+                ", " + str(self.row1[1]) +
+                ", " + str(self.row1[2]) +
+                "], [" + str(self.row2[0]) +
+                ", " + str(self.row2[1]) +
+                ", " + str(self.row2[2]) +
+                "], [" + str(self.row3[0]) +
+                ", " + str(self.row3[1]) +
+                ", " + str(self.row3[2]) +
+                "], [" + str(self.row4[0]) +
+                ", " + str(self.row4[1]) +
+                ", " + str(self.row4[2]) + "])"
+        )
+
+    def setPosition(self, vec=[0.0, 0.0, 0.0]):
+        self.row4 = [vec[0], vec[1], vec[2]]
+        return None
+
+    def position(self):
+        return self.row4
+
+    def asMat3(self):
+        return (
+            (self.row1[0], self.row1[1], self.row1[2]),
+            (self.row2[0], self.row2[1], self.row2[2]),
+            (self.row3[0], self.row3[1], self.row3[2]),
+            (self.row4[0], self.row4[1], self.row4[2])
+        )
+
+    def asMat4(self):
+        return (
+            (self.row1[0], self.row1[1], self.row1[2], 0.0),
+            (self.row2[0], self.row2[1], self.row2[2], 0.0),
+            (self.row3[0], self.row3[1], self.row3[2], 0.0),
+            (self.row4[0], self.row4[1], self.row4[2], 1.0)
+        )
+
+    def asQuat(self):
+        r11 = self.row1[0]
+        r12 = self.row1[1]
+        r13 = self.row1[2]
+        r21 = self.row2[0]
+        r22 = self.row2[1]
+        r23 = self.row2[2]
+        r31 = self.row3[0]
+        r32 = self.row3[1]
+        r33 = self.row3[2]
+        q0 = (r11 + r22 + r33 + 1.0) / 4.0;
+        q1 = (r11 - r22 - r33 + 1.0) / 4.0;
+        q2 = (-r11 + r22 - r33 + 1.0) / 4.0;
+        q3 = (-r11 - r22 + r33 + 1.0) / 4.0;
+        if q0 < 0.0: q0 = 0.0
+        if q1 < 0.0: q1 = 0.0
+        if q2 < 0.0: q2 = 0.0
+        if q3 < 0.0: q3 = 0.0
+        q0 = sqrt(q0)
+        q1 = sqrt(q1)
+        q2 = sqrt(q2)
+        q3 = sqrt(q3)
+        if q0 >= q1 and q0 >= q2 and q0 >= q3:
+            q0 *= 1.0
+            q1 = q1 * 1.0 if (r32 - r23) >= 0.0 else q1 * -1.0
+            q2 = q2 * 1.0 if (r13 - r31) >= 0.0 else q2 * -1.0
+            q3 = q3 * 1.0 if (r21 - r12) >= 0.0 else q3 * -1.0
+        elif q1 >= q0 and q1 >= q2 and q1 >= q3:
+            q0 = q0 * 1.0 if (r32 - r23) >= 0.0 else q0 * -1.0
+            q1 *= 1.0
+            q2 = q2 * 1.0 if (r21 + r12) >= 0.0 else q2 * -1.0
+            q3 = q3 * 1.0 if (r13 + r31) >= 0.0 else q3 * -1.0
+        elif q2 >= q0 and q2 >= q1 and q2 >= q3:
+            q0 = q0 * 1.0 if (r13 - r31) >= 0.0 else q0 * -1.0
+            q1 = q1 * 1.0 if (r21 + r12) >= 0.0 else q1 * -1.0
+            q2 *= 1.0
+            q3 = q3 * 1.0 if (r32 + r23) >= 0.0 else q3 * -1.0
+        elif q3 >= q0 and q3 >= q1 and q3 >= q2:
+            q0 = q0 * 1.0 if (r21 - r12) >= 0.0 else q0 * -1.0
+            q1 = q1 * 1.0 if (r31 + r13) >= 0.0 else q1 * -1.0
+            q2 = q2 * 1.0 if (r32 + r23) >= 0.0 else q2 * -1.0
+            q3 *= 1.0
+        else:
+            format("error\n")
+        r = sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3)
+        q0 /= r
+        q1 /= r
+        q2 /= r
+        q3 /= r
+        return [q0, q1, q2, q3]
+
+    def inverse(self):
+        row1_3 = 0.0
+        row2_3 = 0.0
+        row3_3 = 0.0
+        row4_3 = 1.0
+        inv = [float] * 16
+        inv[0] = (self.row2[1] * self.row3[2] * row4_3 -
+                  self.row2[1] * row3_3 * self.row4[2] -
+                  self.row3[1] * self.row2[2] * row4_3 +
+                  self.row3[1] * row2_3 * self.row4[2] +
+                  self.row4[1] * self.row2[2] * row3_3 -
+                  self.row4[1] * row2_3 * self.row3[2])
+        inv[4] = (-self.row2[0] * self.row3[2] * row4_3 +
+                  self.row2[0] * row3_3 * self.row4[2] +
+                  self.row3[0] * self.row2[2] * row4_3 -
+                  self.row3[0] * row2_3 * self.row4[2] -
+                  self.row4[0] * self.row2[2] * row3_3 +
+                  self.row4[0] * row2_3 * self.row3[2])
+        inv[8] = (self.row2[0] * self.row3[1] * row4_3 -
+                  self.row2[0] * row3_3 * self.row4[1] -
+                  self.row3[0] * self.row2[1] * row4_3 +
+                  self.row3[0] * row2_3 * self.row4[1] +
+                  self.row4[0] * self.row2[1] * row3_3 -
+                  self.row4[0] * row2_3 * self.row3[1])
+        inv[12] = (-self.row2[0] * self.row3[1] * self.row4[2] +
+                   self.row2[0] * self.row3[2] * self.row4[1] +
+                   self.row3[0] * self.row2[1] * self.row4[2] -
+                   self.row3[0] * self.row2[2] * self.row4[1] -
+                   self.row4[0] * self.row2[1] * self.row3[2] +
+                   self.row4[0] * self.row2[2] * self.row3[1])
+        inv[1] = (-self.row1[1] * self.row3[2] * row4_3 +
+                  self.row1[1] * row3_3 * self.row4[2] +
+                  self.row3[1] * self.row1[2] * row4_3 -
+                  self.row3[1] * row1_3 * self.row4[2] -
+                  self.row4[1] * self.row1[2] * row3_3 +
+                  self.row4[1] * row1_3 * self.row3[2])
+        inv[5] = (self.row1[0] * self.row3[2] * row4_3 -
+                  self.row1[0] * row3_3 * self.row4[2] -
+                  self.row3[0] * self.row1[2] * row4_3 +
+                  self.row3[0] * row1_3 * self.row4[2] +
+                  self.row4[0] * self.row1[2] * row3_3 -
+                  self.row4[0] * row1_3 * self.row3[2])
+        inv[9] = (-self.row1[0] * self.row3[1] * row4_3 +
+                  self.row1[0] * row3_3 * self.row4[1] +
+                  self.row3[0] * self.row1[1] * row4_3 -
+                  self.row3[0] * row1_3 * self.row4[1] -
+                  self.row4[0] * self.row1[1] * row3_3 +
+                  self.row4[0] * row1_3 * self.row3[1])
+        inv[13] = (self.row1[0] * self.row3[1] * self.row4[2] -
+                   self.row1[0] * self.row3[2] * self.row4[1] -
+                   self.row3[0] * self.row1[1] * self.row4[2] +
+                   self.row3[0] * self.row1[2] * self.row4[1] +
+                   self.row4[0] * self.row1[1] * self.row3[2] -
+                   self.row4[0] * self.row1[2] * self.row3[1])
+        inv[2] = (self.row1[1] * self.row2[2] * row4_3 -
+                  self.row1[1] * row2_3 * self.row4[2] -
+                  self.row2[1] * self.row1[2] * row4_3 +
+                  self.row2[1] * row1_3 * self.row4[2] +
+                  self.row4[1] * self.row1[2] * row2_3 -
+                  self.row4[1] * row1_3 * self.row2[2])
+        inv[6] = (-self.row1[0] * self.row2[2] * row4_3 +
+                  self.row1[0] * row2_3 * self.row4[2] +
+                  self.row2[0] * self.row1[2] * row4_3 -
+                  self.row2[0] * row1_3 * self.row4[2] -
+                  self.row4[0] * self.row1[2] * row2_3 +
+                  self.row4[0] * row1_3 * self.row2[2])
+        inv[10] = (self.row1[0] * self.row2[1] * row4_3 -
+                   self.row1[0] * row2_3 * self.row4[1] -
+                   self.row2[0] * self.row1[1] * row4_3 +
+                   self.row2[0] * row1_3 * self.row4[1] +
+                   self.row4[0] * self.row1[1] * row2_3 -
+                   self.row4[0] * row1_3 * self.row2[1])
+        inv[14] = (-self.row1[0] * self.row2[1] * self.row4[2] +
+                   self.row1[0] * self.row2[2] * self.row4[1] +
+                   self.row2[0] * self.row1[1] * self.row4[2] -
+                   self.row2[0] * self.row1[2] * self.row4[1] -
+                   self.row4[0] * self.row1[1] * self.row2[2] +
+                   self.row4[0] * self.row1[2] * self.row2[1])
+        inv[3] = (-self.row1[1] * self.row2[2] * row3_3 +
+                  self.row1[1] * row2_3 * self.row3[2] +
+                  self.row2[1] * self.row1[2] * row3_3 -
+                  self.row2[1] * row1_3 * self.row3[2] -
+                  self.row3[1] * self.row1[2] * row2_3 +
+                  self.row3[1] * row1_3 * self.row2[2])
+        inv[7] = (self.row1[0] * self.row2[2] * row3_3 -
+                  self.row1[0] * row2_3 * self.row3[2] -
+                  self.row2[0] * self.row1[2] * row3_3 +
+                  self.row2[0] * row1_3 * self.row3[2] +
+                  self.row3[0] * self.row1[2] * row2_3 -
+                  (self.row3[0] * row1_3 * self.row2[2]))
+        inv[11] = (-self.row1[0] * self.row2[1] * row3_3 +
+                   self.row1[0] * row2_3 * self.row3[1] +
+                   self.row2[0] * self.row1[1] * row3_3 -
+                   self.row2[0] * row1_3 * self.row3[1] -
+                   self.row3[0] * self.row1[1] * row2_3 +
+                   self.row3[0] * row1_3 * self.row2[1])
+        inv[15] = (self.row1[0] * self.row2[1] * self.row3[2] -
+                   self.row1[0] * self.row2[2] * self.row3[1] -
+                   self.row2[0] * self.row1[1] * self.row3[2] +
+                   self.row2[0] * self.row1[2] * self.row3[1] +
+                   self.row3[0] * self.row1[1] * self.row2[2] -
+                   self.row3[0] * self.row1[2] * self.row2[1])
+        det = self.row1[0] * inv[0] + self.row1[1] * inv[4] + self.row1[2] * inv[8] + row1_3 * inv[12]
+        if det != 0:
+            det = 1.0 / det
+            return (matrix3(
+                [inv[0] * det, inv[1] * det, inv[2] * det],
+                [inv[4] * det, inv[5] * det, inv[6] * det],
+                [inv[8] * det, inv[9] * det, inv[10] * det],
+                [inv[12] * det, inv[13] * det, inv[14] * det]
+            ))
+        else:
+            return matrix3(self.row1, self.row2, self.row3, self.row4)
+
+    def multiply(self, B):
+        C = matrix3()
+        A_row1_3, A_row2_3, A_row3_3, A_row4_3 = 0.0, 0.0, 0.0, 1.0
+        if type(B).__name__ == "matrix3":
+            C.row1 = [
+                self.row1[0] * B.row1[0] + self.row1[1] * B.row2[0] + self.row1[2] * B.row3[0] + A_row1_3 * B.row4[0],
+                self.row1[0] * B.row1[1] + self.row1[1] * B.row2[1] + self.row1[2] * B.row3[1] + A_row1_3 * B.row4[1],
+                self.row1[0] * B.row1[2] + self.row1[1] * B.row2[2] + self.row1[2] * B.row3[2] + A_row1_3 * B.row4[2]
+            ]
+            C.row2 = [
+                self.row2[0] * B.row1[0] + self.row2[1] * B.row2[0] + self.row2[2] * B.row3[0] + A_row2_3 * B.row4[0],
+                self.row2[0] * B.row1[1] + self.row2[1] * B.row2[1] + self.row2[2] * B.row3[1] + A_row2_3 * B.row4[1],
+                self.row2[0] * B.row1[2] + self.row2[1] * B.row2[2] + self.row2[2] * B.row3[2] + A_row2_3 * B.row4[2],
+            ]
+            C.row3 = [
+                self.row3[0] * B.row1[0] + self.row3[1] * B.row2[0] + self.row3[2] * B.row3[0] + A_row3_3 * B.row4[0],
+                self.row3[0] * B.row1[1] + self.row3[1] * B.row2[1] + self.row3[2] * B.row3[1] + A_row3_3 * B.row4[1],
+                self.row3[0] * B.row1[2] + self.row3[1] * B.row2[2] + self.row3[2] * B.row3[2] + A_row3_3 * B.row4[2]
+            ]
+            C.row4 = [
+                self.row4[0] * B.row1[0] + self.row4[1] * B.row2[0] + self.row4[2] * B.row3[0] + A_row4_3 * B.row4[0],
+                self.row4[0] * B.row1[1] + self.row4[1] * B.row2[1] + self.row4[2] * B.row3[1] + A_row4_3 * B.row4[1],
+                self.row4[0] * B.row1[2] + self.row4[1] * B.row2[2] + self.row4[2] * B.row3[2] + A_row4_3 * B.row4[2]
+            ]
+        elif (type(B).__name__ == "tuple" or type(B).__name__ == "list"):
+            C.row1 = [
+                self.row1[0] * [0][0] + self.row1[1] * [1][0] + self.row1[2] * [2][0] + A_row1_3 * [3][0],
+                self.row1[0] * [0][1] + self.row1[1] * [1][1] + self.row1[2] * [2][1] + A_row1_3 * [3][1],
+                self.row1[0] * [0][2] + self.row1[1] * [1][2] + self.row1[2] * [2][2] + A_row1_3 * [3][2]
+            ]
+            C.row2 = [
+                self.row2[0] * [0][0] + self.row2[1] * [1][0] + self.row2[2] * [2][0] + A_row2_3 * [3][0],
+                self.row2[0] * [0][1] + self.row2[1] * [1][1] + self.row2[2] * [2][1] + A_row2_3 * [3][1],
+                self.row2[0] * [0][2] + self.row2[1] * [1][2] + self.row2[2] * [2][2] + A_row2_3 * [3][2],
+            ]
+            C.row3 = [
+                self.row3[0] * [0][0] + self.row3[1] * [1][0] + self.row3[2] * [2][0] + A_row3_3 * [3][0],
+                self.row3[0] * [0][1] + self.row3[1] * [1][1] + self.row3[2] * [2][1] + A_row3_3 * [3][1],
+                self.row3[0] * [0][2] + self.row3[1] * [1][2] + self.row3[2] * [2][2] + A_row3_3 * [3][2]
+            ]
+            C.row4 = [
+                self.row4[0] * [0][0] + self.row4[1] * [1][0] + self.row4[2] * [2][0] + A_row4_3 * [3][0],
+                self.row4[0] * [0][1] + self.row4[1] * [1][1] + self.row4[2] * [2][1] + A_row4_3 * [3][1],
+                self.row4[0] * [0][2] + self.row4[1] * [1][2] + self.row4[2] * [2][2] + A_row4_3 * [3][2]
+            ]
+        return C
+
+
+def eulerAnglesToMatrix3(rotXangle=0.0, rotYangle=0.0, rotZangle=0.0):
+    # https://stackoverflow.com/a/47283530
+    cosY = math.cos(rotZangle)
+    sinY = math.sin(rotZangle)
+    cosP = math.cos(rotYangle)
+    sinP = math.sin(rotYangle)
+    cosR = math.cos(rotXangle)
+    sinR = math.sin(rotXangle)
+    m = matrix3(
+        [cosP * cosY, cosP * sinY, -sinP],
+        [sinR * cosY * sinP - sinY * cosR, cosY * cosR + sinY * sinP * sinR, cosP * sinR],
+        [sinY * sinR + cosR * cosY * sinP, cosR * sinY * sinP - sinR * cosY, cosR * cosP],
+        [0.0, 0.0, 0.0]
+    )
+    return m
+
+
+def transMatrix(t=[0.0, 0.0, 0.0]):
+    mat = matrix3(
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+        (t[0], t[1], t[2])
+    )
+    return mat
+
+
+def inverse(mat=matrix3()):
+    return mat.inverse()
+
+
+def quatToMatrix3(q=[0.0, 0.0, 0.0, 0.0]):
+    """
+        Covert a quaternion into a full three-dimensional rotation matrix.
+
+        Input
+        :param Q: A 4 element array representing the quaternion (q0,q1,q2,q3)
+
+        Output
+        :return: A 3x3 element matrix representing the full 3D rotation matrix.
+                 This rotation matrix converts a point in the local reference
+                 frame to a point in the global reference frame.
+    """
+
+    sqw = q[3] * q[3]
+    sqx = q[0] * q[0]
+    sqy = q[1] * q[1]
+    sqz = q[2] * q[2]
+
+    # invs (inverse square length) is only required if quaternion is not already normalised
+    invs = 1.0
+    if (sqx + sqy + sqz + sqw) > 0.0: invs = 1.0 / (sqx + sqy + sqz + sqw)
+    m00 = (sqx - sqy - sqz + sqw) * invs  # since sqw + sqx + sqy + sqz =1/invs*invs
+    m11 = (-sqx + sqy - sqz + sqw) * invs
+    m22 = (-sqx - sqy + sqz + sqw) * invs
+
+    tmp1 = q[0] * q[1]
+    tmp2 = q[2] * q[3]
+    m10 = 2.0 * (tmp1 + tmp2) * invs
+    m01 = 2.0 * (tmp1 - tmp2) * invs
+
+    tmp1 = q[0] * q[2]
+    tmp2 = q[1] * q[3]
+    m20 = 2.0 * (tmp1 - tmp2) * invs
+    m02 = 2.0 * (tmp1 + tmp2) * invs
+
+    tmp1 = q[1] * q[2]
+    tmp2 = q[0] * q[3]
+    m21 = 2.0 * (tmp1 + tmp2) * invs
+    m12 = 2.0 * (tmp1 - tmp2) * invs
+
+    # 3x3 rotation matrix
+    mat = matrix3(
+        (m00, m10, m20),
+        (m01, m11, m21),
+        (m02, m12, m22),
+        (0.0, 0.0, 0.0)
+    )
+    return mat
+
+
+class skinOps:
+    mesh = None
+    skin = None
+    armature = None
+
+    def __init__(self, meshObj, armObj, skinName="Skin"):
+        self.mesh = meshObj
+        self.armature = armObj
+        if self.mesh != None:
+            for m in self.mesh.modifiers:
+                if m.type == "ARMATURE":
+                    self.skin = m
+                    break
+            if self.skin == None:
+                self.skin = self.mesh.modifiers.new(type="ARMATURE", name=skinName)
+            self.skin.use_vertex_groups = True
+            self.skin.object = self.armature
+            self.mesh.parent = self.armature
+
+    def addbone(self, boneName, update_flag=0):
+        # Adds a bone to the vertex group list
+        # print("boneName:\t%s" % boneName)
+        vertGroup = self.mesh.vertex_groups.get(boneName)
+        if not vertGroup:
+            self.mesh.vertex_groups.new(name=boneName)
+        return None
+
+    def NormalizeWeights(self, weight_array, roundTo=0):
+        # Makes All weights in the weight_array sum to 1.0
+        # Set roundTo 0.01 to limit weight; 0.33333 -> 0.33
+        n = []
+        if len(weight_array) > 0:
+            s = 0.0
+            n = [float] * len(weight_array)
+            for i in range(0, len(weight_array)):
+                if roundTo != 0:
+                    n[i] = (float(int(weight_array[i] * (1.0 / roundTo)))) / (1.0 / roundTo)
+                else:
+                    n[i] = weight_array[i]
+                s += n[i]
+            s = 1.0 / s
+            for i in range(0, len(weight_array)):
+                n[i] *= s
+        return n
+
+    def GetNumberBones(self):
+        # Returns the number of bones present in the vertex group list
+        num = 0
+        for b in self.armature.data.bones:
+            if self.mesh.vertex_groups.get(b.name):
+                num += 1
+        return num
+
+    def GetNumberVertices(self):
+        # Returns the number of vertices for the object the Skin modifier is applied to.
+        return len(self.mesh.data.vertices)
+
+    def ReplaceVertexWeights(self, vertex_integer, vertex_bone_array, weight_array):
+        # Sets the influence of the specified bone(s) to the specified vertex.
+        # Any influence weights for the bone(s) that are not specified are erased.
+        # If the bones and weights are specified as arrays, the arrays must be of the same size.
+
+        # Check that both arrays match
+        numWeights = len(vertex_bone_array)
+        if len(weight_array) == numWeights and numWeights > 0:
+
+            # Erase Any Previous Weight
+
+            # for g in self.mesh.data.vertices[vertex_integer].groups:
+            #    self.mesh.vertex_groups[g.index].add([vertex_integer], 0.0, 'REPLACE')
+
+            for g in range(0, len(self.mesh.data.vertices[vertex_integer].groups)):
+                self.mesh.vertex_groups[g].add([vertex_integer], 0.0, 'REPLACE')
+
+            # Add New Weights
+            for i in range(0, numWeights):
+                self.mesh.vertex_groups[vertex_bone_array[i]].add([vertex_integer], weight_array[i], 'REPLACE')
+            return True
+        return False
+
+    def GetVertexWeightCount(self, vertex_integer):
+        # Returns the number of bones (vertex groups) influencing the specified vertex.
+        num = 0
+        for g in self.mesh.vertices[vertex_integer].groups:
+            # need to write more crap
+            # basically i need to know if the vertex group is for a bone and is even label as deformable
+            # but lzy, me fix l8tr
+            num += 1
+        return num
+
+    def boneAffectLimit(self, limit):
+        # Reduce the number of bone influences affecting a single vertex
+        # I copied and pasted busted ass code from somewhere as an example to
+        # work from... still need to write this out but personally dont have a
+        # need for it
+        # for v in self.mesh.vertices:
+
+        #     # Get a list of the non-zero group weightings for the vertex
+        #     nonZero = []
+        #     for g in v.groups:
+
+        #         g.weight = round(g.weight, 4)
+
+        #         if g.weight & lt; .0001:
+        #             continue
+
+        #         nonZero.append(g)
+
+        #     # Sort them by weight decending
+        #     byWeight = sorted(nonZero, key=lambda group: group.weight)
+        #     byWeight.reverse()
+
+        #     # As long as there are more than 'maxInfluence' bones, take the lowest influence bone
+        #     # and distribute the weight to the other bones.
+        #     while len(byWeight) & gt; limit:
+
+        #         #print("Distributing weight for vertex %d" % (v.index))
+
+        #         # Pop the lowest influence off and compute how much should go to the other bones.
+        #         minInfluence = byWeight.pop()
+        #         distributeWeight = minInfluence.weight / len(byWeight)
+        #         minInfluence.weight = 0
+
+        #         # Add this amount to the other bones
+        #         for influence in byWeight:
+        #             influence.weight = influence.weight + distributeWeight
+
+        #         # Round off the remaining values.
+        #         for influence in byWeight:
+        #             influence.weight = round(influence.weight, 4)
+        return None
+
+    def GetVertexWeightBoneID(self, vertex_integer, vertex_bone_integer):
+        # Returns the vertex group index of the Nth bone affecting the specified vertex.
+
+        return None
+
+    def GetVertexWeight(self, vertex_integer, vertex_bone_integer):
+        # Returns the influence of the Nth bone affecting the specified vertex.
+        for v in mesh.data.vertices:  # <MeshVertex>                              https://docs.blender.org/api/current/bpy.types.MeshVertex.html
+            weights = [g.weight for g in v.groups]
+            boneids = [g.group for g in v.groups]
+        # return [vert for vert in bpy.context.object.data.vertices if bpy.context.object.vertex_groups['vertex_group_name'].index in [i.group for i in vert.groups]]
+        return [vert for vert in bpy.context.object.data.vertices if
+                bpy.context.object.vertex_groups['vertex_group_name'].index in [i.group for i in vert.groups]]
+
+    def GetVertexWeightByBoneName(self, vertex_bone_name):
+        return [vert for vert in self.mesh.data.vertices if
+                self.mesh.data.vertex_groups[vertex_bone_name].index in [i.group for i in vert.groups]]
+
+    def GetSelectedBone(self):
+        # Returns the index of the current selected bone in the Bone list.
+        return self.mesh.vertex_groups.active_index
+
+    def GetBoneName(self, bone_index, nameflag_index=0):
+        # Returns the bone name or node name of a bone specified by ID.
+        name = ""
+        try:
+            name = self.mesh.vertex_groups[bone_index].name
+        except:
+            pass
+        return name
+
+    def GetListIDByBoneID(self, BoneID_integer):
+        # Returns the ListID index given the BoneID index value.
+        # The VertexGroupListID index is the index into the name-sorted.
+        # The BoneID index is the non-sorted index, and is the index used by other methods that require a bone index.
+        index = -1
+        try:
+            index = self.mesh.vertex_groups[self.armature.data.bones[BoneID_integer]].index
+        except:
+            pass
+        return index
+
+    def GetBoneIDByListID(self, bone_index):
+        # Returns the BoneID index given the ListID index value. The ListID index is the index into the name-sorted bone listbox.
+        # The BoneID index is the non-sorted index, and is the index used by other methods that require a bone index
+        index = -1
+        try:
+            index = self.armature.data.bones[self.mesh.vertex_groups[bone_index].name].index
+        except:
+            pass
+        return index
+
+    def weightAllVertices(self):
+        # Ensure all weights have weight and that are equal to a sum of 1.0
+        return None
+
+    def clearZeroWeights(self, limit=0.0):
+        # Removes weights that are a threshold
+        # for v in self.mesh.vertices:
+        #     nonZero = []
+        #     for g in v.groups:
+
+        #         g.weight = round(g.weight, 4)
+
+        #         if g.weight & le; limit:
+        #             continue
+
+        #         nonZero.append(g)
+
+        #     # Sort them by weight decending
+        #     byWeight = sorted(nonZero, key=lambda group: group.weight)
+        #     byWeight.reverse()
+
+        #     # As long as there are more than 'maxInfluence' bones, take the lowest influence bone
+        #     # and distribute the weight to the other bones.
+        #     while len(byWeight) & gt; limit:
+
+        #         #print("Distributing weight for vertex %d" % (v.index))
+
+        #         # Pop the lowest influence off and compute how much should go to the other bones.
+        #         minInfluence = byWeight.pop()
+        #         distributeWeight = minInfluence.weight / len(byWeight)
+        #         minInfluence.weight = 0
+
+        #         # Add this amount to the other bones
+        #         for influence in byWeight:
+        #             influence.weight = influence.weight + distributeWeight
+
+        #         # Round off the remaining values.
+        #         for influence in byWeight:
+        #             influence.weight = round(influence.weight, 4)
+        return None
+
+    def SelectBone(self, bone_integer):
+        # Selects the specified bone in the Vertex Group List
+        self.mesh.vertex_groups.active_index = bone_integer
+        return None
+
+    # Probably wont bother writing this unless I really need this ability
+    def saveEnvelope(self):
+        # Saves Weight Data to an external binary file
+        return None
+
+    def saveEnvelopeAsASCII(self):
+        # Saves Weight Data to an external ASCII file
+        envASCII = "ver 3\n"
+        envASCII = "numberBones " + str(self.GetNumberBones()) + "\n"
+        num = 0
+        for b in self.armature.data.bones:
+            if self.mesh.vertex_groups.get(b.name):
+                envASCII += "[boneName] " + b.name + "\n"
+                envASCII += "[boneID] " + str(num) + "\n"
+                envASCII += "  boneFlagLock 0\n"
+                envASCII += "  boneFlagAbsolute 2\n"
+                envASCII += "  boneFlagSpline 0\n"
+                envASCII += "  boneFlagSplineClosed 0\n"
+                envASCII += "  boneFlagDrawEnveloe 0\n"
+                envASCII += "  boneFlagIsOldBone 0\n"
+                envASCII += "  boneFlagDead 0\n"
+                envASCII += "  boneFalloff 0\n"
+                envASCII += "  boneStartPoint 0.000000 0.000000 0.000000\n"
+                envASCII += "  boneEndPoint 0.000000 0.000000 0.000000\n"
+                envASCII += "  boneCrossSectionCount 2\n"
+                envASCII += "    boneCrossSectionInner0 3.750000\n"
+                envASCII += "    boneCrossSectionOuter0 13.125000\n"
+                envASCII += "    boneCrossSectionU0 0.000000\n"
+                envASCII += "    boneCrossSectionInner1 3.750000\n"
+                envASCII += "    boneCrossSectionOuter1 13.125000\n"
+                envASCII += "    boneCrossSectionU1 1.000000\n"
+                num += 1
+        envASCII += "[Vertex Data]\n"
+        envASCII += "  nodeCount 1\n"
+        envASCII += "  [baseNodeName] " + self.mesh.name + "\n"
+        envASCII += "    vertexCount " + str(len(self.mesh.vertices)) + "\n"
+        for v in self.mesh.vertices:
+            envASCII += "    [vertex" + str(v.index) + "]\n"
+            envASCII += "      vertexIsModified 0\n"
+            envASCII += "      vertexIsRigid 0\n"
+            envASCII += "      vertexIsRigidHandle 0\n"
+            envASCII += "      vertexIsUnNormalized 0\n"
+            envASCII += "      vertexLocalPosition 0.000000 0.000000 24.38106\n"
+            envASCII += "      vertexWeightCount " + str(len(v.groups)) + "\n"
+            envASCII += "      vertexWeight "
+            for g in v.groups:
+                envASCII += str(g.group) + ","
+                envASCII += str(g.weight) + " "
+            envASCII += "      vertexSplineData 0.000000 0 0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000   "
+        envASCII += "  numberOfExclusinList 0\n"
+        return envASCII
+
+    def loadEnvelope(self):
+        # Imports Weight Data to an external Binary file
+        return None
+
+    def loadEnvelopeAsASCII(self):
+        # Imports Weight Data to an external ASCII file
+        return None
+
+
+class boneSys:
+    armature = None
+    layer = None
+
+    def __init__(self, armatureName="Skeleton", layerName="", rootName="Scene Root"):
+
+        # Clear Any Object Selections
+        # for o in bpy.context.selected_objects: o.select = False
+        bpy.context.view_layer.objects.active = None
+
+        # Get Collection (Layers)
+        if self.layer == None:
+            if layerName != "":
+                # make collection
+                self.layer = bpy.data.collections.new(layerName)
+                bpy.context.scene.collection.children.link(self.layer)
+            else:
+                self.layer = bpy.data.collections[0]
+
+        # Check for Armature
+        armName = armatureName
+        if armatureName == "": armName = "Skeleton"
+        self.armature = bpy.context.scene.objects.get(armName)
+
+        if self.armature == None:
+            # Create Root Bone
+            root = bpy.data.armatures.new(rootName)
+            root.name = rootName
+
+            # Create Armature
+            self.armature = bpy.data.objects.new(armName, root)
+            self.layer.objects.link(self.armature)
+
+        self.armature.display_type = 'WIRE'
+        self.armature.show_in_front = True
+
+    def editMode(self, enable=True):
+        #
+        # Data Pointers Seem to get arranged between
+        # Entering and Exiting EDIT Mode, which is
+        # Required to make changes to the bones
+        #
+        # This needs to be called beofre and after making changes
+        #
+
+        if enable:
+            # Clear Any Object Selections
+            bpy.context.view_layer.objects.active = None
+
+            # Set Armature As Active Selection
+            if bpy.context.view_layer.objects.active != self.armature:
+                bpy.context.view_layer.objects.active = self.armature
+
+            # Switch to Edit Mode
+            if bpy.context.object.mode != 'EDIT':
+                bpy.ops.object.mode_set(mode='EDIT', toggle=False)
+        else:
+            bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
+        return None
+
+    def count(self):
+        return len(self.armature.data.bones)
+
+    def getNodeByName(self, boneName):
+        # self.editMode(True)
+        node = None
+        try:
+            # node = self.armature.data.bones.get('boneName')
+            node = self.armature.data.edit_bones[boneName]
+        except:
+            pass
+        # self.editMode(False)
+        return node
+
+    def getChildren(self, boneName):
+        childs = []
+        b = self.getNodeByName(boneName)
+        if b != None:
+            for bone in self.armature.data.edit_bones:
+                if bone.parent == b: childs.append(bone)
+        return childs
+
+    def setParent(self, boneName, parentName):
+        b = self.getNodeByName(boneName)
+        p = self.getNodeByName(parentName)
+        if b != None and p != None:
+            b.parent = p
+            return True
+        return False
+
+    def getParent(self, boneName):
+        par = None
+        b = self.getNodeByName(boneName)
+        if b != None: par = b.parent
+        return par
+
+    def getPosition(self, boneName):
+        position = (0.0, 0.0, 0.0)
+        b = self.getNodeByName(boneName)
+        if b != None:
+            position = (
+                self.armature.location[0] + b.head[0],
+                self.armature.location[1] + b.head[1],
+                self.armature.location[2] + b.head[2],
+            )
+        return position
+
+    def setPosition(self, boneName, position):
+        b = self.getNodeByName(boneName)
+        pos = (
+            position[0] - self.armature.location[0],
+            position[1] - self.armature.location[1],
+            position[2] - self.armature.location[2]
+        )
+        if b != None and distance(b.tail, pos) > 0.0000001: b.head = pos
+        return None
+
+    def getEndPosition(self, boneName):
+        position = (0.0, 0.0, 0.0)
+        b = self.getNodeByName(boneName)
+        if b != None:
+            position = (
+                self.armature.location[0] + b.tail[0],
+                self.armature.location[1] + b.tail[1],
+                self.armature.location[2] + b.tail[2],
+            )
+        return position
+
+    def setEndPosition(self, boneName, position):
+        b = self.getNodeByName(boneName)
+        pos = (
+            position[0] - self.armature.location[0],
+            position[1] - self.armature.location[1],
+            position[2] - self.armature.location[2]
+        )
+        if b != None and distance(b.head, pos) > 0.0000001: b.tail = pos
+        return None
+
+    def setUserProp(self, boneName, key_string, value):
+        b = self.getNodeByName(boneName)
+        try:
+            if b != None: b[key_string] = value
+            return True
+        except:
+            return False
+
+    def getUserProp(self, boneName, key_string):
+        value = None
+        b = self.getNodeByName(boneName)
+        if b != None:
+            try:
+                value = b[key_string]
+            except:
+                pass
+        return value
+
+    def setTransform(self, boneName, matrix=((1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0), (1.0, 0.0, 0.0, 1.0))):
+        b = self.getNodeByName(boneName)
+        if b != None:
+            b.matrix = matrix
+            return True
+        return False
+
+    def getTransform(self, boneName):
+        # lol wtf does blender not store a transform for the bone???
+        mat = ((1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0), (1.0, 0.0, 0.0, 1.0))
+        b = self.getNodeByName(boneName)
+        if b != None:
+            mat = (
+                (b.matrix[0][0], b.matrix[0][1], b.matrix[0][2], 0.0),
+                (b.matrix[1][0], b.matrix[1][1], b.matrix[1][2], 0.0),
+                (b.matrix[2][0], b.matrix[2][1], b.matrix[2][2], 0.0),
+                (b.head[0] - self.armature.location[0],
+                 b.head[1] - self.armature.location[1],
+                 b.head[2] - self.armature.location[2], 1.0)
+            )
+        return mat
+
+    def setVisibility(self, boneName, visSet=(
+            True, False, False, False, False, False, False, False, False, False, False, False, False, False, False,
+            False,
+            False, False, False, False, False, False, False, False, False, False, False, False, False, False, False,
+            False)):
+        # Assign Visible Layers
+        b = self.getNodeByName(boneName)
+        if b != None:
+            b.layers = visSet
+            return True
+        return False
+
+    def setBoneGroup(self, boneName, normalCol=(0.0, 0.0, 0.0), selctCol=(0.0, 0.0, 0.0), activeCol=(0.0, 0.0, 0.0)):
+        # Create Bone Group (custom bone colours ??)
+        b = self.getNodeByName(boneName)
+        if b != None:
+            # arm = bpy.data.objects.new("Armature", bpy.data.armatures.new("Skeleton"))
+            # layer.objects.link(arm)
+            # obj.parent = arm
+            # bgrp = self.armature.pose.bone_groups.new(name=msh.name)
+            # bgrp.color_set = 'CUSTOM'
+            # bgrp.colors.normal = normalCol
+            # bgrp.colors.select = selctCol
+            # bgrp.colors.active = activeCol
+            # for b in obj.vertex_groups.keys():
+            #    self.armature.pose.bones[b].bone_group = bgrp
+            return True
+        return False
+
+    def createBone(self, boneName="", startPos=(0.0, 0.0, 0.0), endPos=(0.0, 0.0, 1.0), zAxis=(1.0, 0.0, 0.0)):
+
+        self.editMode(True)
+
+        # Check if bone exists
+        b = None
+        if boneName != "":
+            try:
+                b = self.armature.data.edit_bones[boneName]
+                return False
+            except:
+                pass
+
+        if b == None:
+
+            # Generate Bone Name
+            bName = boneName
+            if bName == "": bName = "Bone_" + '{:04d}'.format(len(self.armature.data.edit_bones))
+
+            # Create Bone
+            b = self.armature.data.edit_bones.new(bName)
+            # b = self.armature.data.edit_bones.new(bName.decode('utf-8', 'replace'))
+            b.name = bName
+
+            # Set As Deform Bone
+            b.use_deform = True
+
+            # Set Rotation
+            roll, pitch, yaw = 0.0, 0.0, 0.0
+            try:
+                roll = math.acos((dot(zAxis, (1, 0, 0))) / (
+                        math.sqrt(((pow(zAxis[0], 2)) + (pow(zAxis[1], 2)) + (pow(zAxis[2], 2)))) * 1.0))
+            except:
+                pass
+            try:
+                pitch = math.acos((dot(zAxis, (0, 1, 0))) / (
+                        math.sqrt(((pow(zAxis[0], 2)) + (pow(zAxis[1], 2)) + (pow(zAxis[2], 2)))) * 1.0))
+            except:
+                pass
+            try:
+                yaw = math.acos((dot(zAxis, (0, 0, 1))) / (
+                        math.sqrt(((pow(zAxis[0], 2)) + (pow(zAxis[1], 2)) + (pow(zAxis[2], 2)))) * 1.0))
+            except:
+                pass
+
+            su = math.sin(roll)
+            cu = math.cos(roll)
+            sv = math.sin(pitch)
+            cv = math.cos(pitch)
+            sw = math.sin(yaw)
+            cw = math.cos(yaw)
+
+            b.matrix = (
+                (cv * cw, su * sv * cw - cu * sw, su * sw + cu * sv * cw, 0.0),
+                (cv * sw, cu * cw + su * sv * sw, cu * sv * sw - su * cw, 0.0),
+                (-sv, su * cv, cu * cv, 0.0),
+                (startPos[0], startPos[1], startPos[2], 1.0)
+            )
+
+            # Set Length (has to be larger then 0.1?)
+            b.length = 1.0
+            if startPos != endPos:
+                b.head = startPos
+                b.tail = endPos
+
+        # Exit Edit Mode
+        self.editMode(False)
+        return True
+
+    def rebuildEndPositions(self, mscale=1.0):
+        for b in self.armature.data.edit_bones:
+            children = self.getChildren(b.name)
+            if len(children) == 1:  # Only One Child, Link End to the Child
+                self.setEndPosition(b.name, self.getPosition(children[0].name))
+            elif len(children) > 1:  # Multiple Children, Link End to the Average Position of all Children
+                childPosAvg = [0.0, 0.0, 0.0]
+                for c in children:
+                    childPos = self.getPosition(c.name)
+                    childPosAvg[0] += childPos[0]
+                    childPosAvg[1] += childPos[1]
+                    childPosAvg[2] += childPos[2]
+                self.setEndPosition(b.name,
+                                    (childPosAvg[0] / len(children),
+                                     childPosAvg[1] / len(children),
+                                     childPosAvg[2] / len(children))
+                                    )
+            elif b.parent != None:  # No Children use inverse of parent position
+                childPos = self.getPosition(b.name)
+                parPos = self.getPosition(b.parent.name)
+
+                boneLength = distance(parPos, childPos)
+                boneLength = 0.04 * mscale
+                boneNorm = normalize(
+                    (childPos[0] - parPos[0],
+                     childPos[1] - parPos[1],
+                     childPos[2] - parPos[2])
+                )
+
+                self.setEndPosition(b.name,
+                                    (childPos[0] + boneLength * boneNorm[0],
+                                     childPos[1] + boneLength * boneNorm[1],
+                                     childPos[2] + boneLength * boneNorm[2])
+                                    )
+        return None
+
+
+def messageBox(message="", title="Message Box", icon='INFO'):
+    def draw(self, context): self.layout.label(text=message)
+
+    bpy.context.window_manager.popup_menu(draw, title=title, icon=icon)
+    return None
+
+
+def getNodeByName(nodeName):
+    return bpy.context.scene.objects.get(nodeName)
+
+
+def hide(nodeObj=None):
+    if nodeObj != None:
+        nodeObj.hide_set(True)
+        nodeObj.hide_render = True
+        return True
+    return False
+
+
+def unhide(nodeObj=None):
+    if nodeObj != None:
+        nodeObj.hide_set(False)
+        nodeObj.hide_render = False
+        return True
+    return False
+
+
+def select(nodeObj=None):
+    if nodeObj != None:
+        for obj in bpy.context.selected_objects:
+            obj.select_set(False)
+        nodeObj.select_set(True)
+        bpy.context.view_layer.objects.active = nodeObj
+        return True
+    return False
+
+
+def selectmore(nodeObj=None):
+    if nodeObj != None:
+        nodeObj.select_set(True)
+        bpy.context.view_layer.objects.active = nodeObj
+        return True
+    return False
+
+
+def freeze(nodeObj=None):
+    if nodeObj != None:
+        nodeObj.hide_select(True)
+        return True
+    return False
+
+
+def unfreeze(nodeObj=None):
+    if nodeObj != None:
+        nodeObj.hide_select(False)
+        return True
+    return False
+
+
+def classof(nodeObj):
+    try:
+        return str(nodeObj.type)
+    except:
+        return None
+
+
+def makeDir(folderName):
+    return Path(folderName).mkdir(parents=True, exist_ok=True)
+
+
+def setUserProp(node, key_string, value):
+    try:
+        node[key_string] = value
+        return True
+    except:
+        return False
+
+
+def getUserProp(node, key_string):
+    value = None
+    try:
+        value = node[key_string]
+    except:
+        pass
+    return value
+
+
+def getFileSize(filename):
+    return Path(filename).stat().st_size
+
+
+def doesFileExist(filename):
+    file = Path(filename)
+    if file.is_file():
+        return True
+    elif file.is_dir():
+        return True
+    else:
+        return False
+
+
+def clearListener(len=64):
+    for i in range(0, len): print('')
+
+
+def getFiles(filepath=""):
+    files = []
+
+    fpath = '.'
+    pattern = "*.*"
+
+    # try to split the pattern from the path
+    index = filepath.rfind('/')
+    if index < 0: index = filepath.rfind('\\')
+    if index > -1:
+        fpath = filepath[0:index + 1]
+        pattern = filepath[index + 1:]
+
+    # print("fpath:\t%s" % fpath)
+    # print("pattern:\t%s" % pattern)
+
+    currentDirectory = Path(fpath)
+    for currentFile in currentDirectory.glob(pattern):
+        files.append(currentFile)
+
+    return files
+
+
+def filenameFromPath(file):  # returns: "myImage.jpg"
+    return Path(file).name
+
+
+def getFilenamePath(file):  # returns: "g:\subdir1\subdir2\"
+    return (str(Path(file).resolve().parent) + "\\")
+
+
+def getFilenameFile(file):  # returns: "myImage"
+    return Path(file).stem
+
+
+def getFilenameType(file):  # returns: ".jpg"
+    return Path(file).suffix
+
+
+def toUpper(string):
+    return string.upper()
+
+
+def toLower(string):
+    return string.upper()
+
+
+def padString(string, length=2, padChar="0", toLeft=True):
+    s = str(string)
+    if len(s) > length:
+        s = s[0:length]
+    else:
+        p = ""
+        for i in range(0, length): p += padChar
+        if toLeft:
+            s = p + s
+            s = s[len(s) - length: length + 1]
+        else:
+            s = s + p
+            s = s[0: length]
+    return s
+
+
+def filterString(string, string_search):
+    for s in enumerate(string_search):
+        string.replace(s[1], string_search[0])
+    return string.split(string_search[0])
+
+
+def findString(string="", token_string=""):
+    return string.find(token_string)
+
+
+def findItem(array, value):
+    index = -1
+    try:
+        index = array.index(value)
+    except:
+        pass
+    return index
+
+
+def append(array, value):
+    array.append(value)
+    return None
+
+
+def appendIfUnique(array, value):
+    try:
+        array.index(value)
+    except:
+        array.append(value)
+    return None
+
+
+class StandardMaterial:
+    data = None
+    bsdf = None
+
+    maxWidth = 1024
+    nodeHeight = 512
+    nodeWidth = 256
+    nodePos = [0.0, 256.0]
+
+    def __init__(self, name="Material"):
+        # make material
+        self.nodePos[0] -= self.nodeWidth
+        self.data = bpy.data.materials.new(name=name)
+        self.data.use_nodes = True
+        self.data.use_backface_culling = True
+        self.bsdf = self.data.node_tree.nodes["Principled BSDF"]
+        self.bsdf.label = "Standard"
+        pass
+
+    def addNodeArea(self, nodeObj):
+        nodeObj.location.x = self.nodePos[0]
+        nodeObj.location.y = self.nodePos[1]
+        self.nodePos[0] -= self.nodeWidth
+        if nodeObj.dimensions[1] > self.nodeHeight: self.nodeHeight = nodeObj.dimensions[1]
+        if -nodeObj.location.x > self.maxWidth:
+            self.nodePos[0] = -self.nodeWidth
+            self.nodePos[1] -= self.nodeHeight
+
+    def add(self, node_type):
+        nodeObj = self.data.node_tree.nodes.new(node_type)
+        self.addNodeArea(nodeObj)
+        return nodeObj
+
+    def attach(self, node_out, node_in):
+        self.data.node_tree.links.new(node_in, node_out)
+        return None
+
+    def detach(self, node_con):
+        self.data.node_tree.links.remove(node_con.links[0])
+        return None
+
+    def AddColor(self, name="", colour=(0.0, 0.0, 0.0, 0.0)):
+        rgbaColor = self.data.node_tree.nodes.new('ShaderNodeRGB')
+        self.addNodeArea(rgbaColor)
+        if name != "":
+            rgbaColor.label = name
+        rgbaColor.outputs[0].default_value = (colour[0], colour[1], colour[2], colour[3])
+        if self.bsdf != None and self.bsdf.inputs['Base Color'] == None:
+            self.data.node_tree.links.new(self.bsdf.inputs['Base Color'], rgbaColor.outputs['Color'])
+        return rgbaColor
+
+    def Bitmaptexture(self, filename="", alpha=False, name="ShaderNodeTexImage"):
+        imageTex = self.data.node_tree.nodes.new('ShaderNodeTexImage')
+        imageTex.label = name
+        self.addNodeArea(imageTex)
+        try:
+            imageTex.image = bpy.data.images.load(
+                filepath=filename,
+                check_existing=False
+            )
+            imageTex.image.name = filenameFromPath(filename)
+            imageTex.image.colorspace_settings.name = 'sRGB'
+            if not alpha:
+                imageTex.image.alpha_mode = 'NONE'
+            else:
+                imageTex.image.alpha_mode = 'STRAIGHT'  # PREMUL
+        except:
+            imageTex.image = bpy.data.images.new(
+                name=filename,
+                width=8,
+                height=8,
+                alpha=False,
+                float_buffer=False
+            )
+        return imageTex
+
+    def diffuseMap(self, imageTex=None, alpha=False, name="ShaderNodeTexImage"):
+        imageMap = None
+        if imageTex != None and self.bsdf != None:
+            imageMap = self.Bitmaptexture(filename=imageTex, alpha=alpha, name=name)
+            self.data.node_tree.links.new(self.bsdf.inputs['Base Color'], imageMap.outputs['Color'])
+        return imageMap
+
+    def opacityMap(self, imageTex=None, name="ShaderNodeTexImage"):
+        imageMap = None
+        if imageTex != None and self.bsdf != None:
+            self.data.blend_method = 'BLEND'
+            self.data.shadow_method = 'HASHED'
+            self.data.show_transparent_back = False
+            imageMap = self.Bitmaptexture(filename=imageTex, alpha=True, name=name)
+            self.data.node_tree.links.new(self.bsdf.inputs['Alpha'], imageMap.outputs['Alpha'])
+        return imageMap
+
+    def normalMap(self, imageTex=None, alpha=False, name="ShaderNodeTexImage"):
+        imageMap = None
+        if imageTex != None and self.bsdf != None:
+            imageMap = self.Bitmaptexture(filename=imageTex, alpha=alpha, name=name)
+            imageMap.image.colorspace_settings.name = 'Linear'
+            normMap = self.add('ShaderNodeNormalMap')
+            normMap.label = 'ShaderNodeNormalMap'
+            self.attach(imageMap.outputs['Color'], normMap.inputs['Color'])
+            self.attach(normMap.outputs['Normal'], self.bsdf.inputs['Normal'])
+        return imageMap
+
+    def specularMap(self, imageTex=None, invert=True, alpha=False, name="ShaderNodeTexImage"):
+        imageMap = None
+        if imageTex != None and self.bsdf != None:
+            imageMap = self.Bitmaptexture(filename=imageTex, alpha=True, name=name)
+            if invert:
+                invertRGB = self.add('ShaderNodeInvert')
+                invertRGB.label = 'ShaderNodeInvert'
+                self.data.node_tree.links.new(invertRGB.inputs['Color'], imageMap.outputs['Color'])
+                self.data.node_tree.links.new(self.bsdf.inputs['Roughness'], invertRGB.outputs['Color'])
+            else:
+                self.data.node_tree.links.new(self.bsdf.inputs['Roughness'], imageMap.outputs['Color'])
+        return imageMap
+
+    def pack_nodes_partition(self, array, begin, end):
+        pivot = begin
+        for i in range(begin + 1, end + 1):
+            if array[i].dimensions[1] >= array[begin].dimensions[1]:
+                pivot += 1
+                array[i], array[pivot] = array[pivot], array[i]
+        array[pivot], array[begin] = array[begin], array[pivot]
+        return pivot
+
+    def pack_nodes_qsort(self, array, begin=0, end=None):
+        if end is None:
+            end = len(array) - 1
+
+        def _quicksort(array, begin, end):
+            if begin >= end:
+                return
+            pivot = self.pack_nodes_partition(array, begin, end)
+            _quicksort(array, begin, pivot - 1)
+            _quicksort(array, pivot + 1, end)
+
+        return _quicksort(array, begin, end)
+
+    def pack_nodes(self, boxes=[], areaRatio=0.95, padding=0.0):
+        # https://observablehq.com/@mourner/simple-rectangle-packing
+        bArea = 0
+        maxWidth = 0
+        for i in range(0, len(boxes)):
+            bArea += (boxes[i].dimensions.x + padding) * (boxes[i].dimensions.y + padding)
+            maxWidth = max(maxWidth, (boxes[i].dimensions.x + padding))
+
+        self.pack_nodes_qsort(boxes)
+        startWidth = max(ceil(sqrt(bArea / areaRatio)), maxWidth)
+        spaces = [[0, 0, 0, startWidth, startWidth * 2]]
+        last = []
+        for i in range(0, len(boxes)):
+            for p in range(len(spaces) - 1, -1, -1):
+                if (boxes[i].dimensions.x + padding) > spaces[p][3] or (boxes[i].dimensions.y + padding) > spaces[p][
+                    4]: continue
+                boxes[i].location.x = spaces[p][0] - (boxes[i].dimensions.x + padding)
+                boxes[i].location.y = spaces[p][1] + (boxes[i].dimensions.y + padding)
+                if (boxes[i].dimensions.x + padding) == spaces[p][3] and (boxes[i].dimensions.y + padding) == spaces[p][
+                    4]:
+                    last = spaces.pop()
+                    if p < spaces.count: spaces[p] = last
+                elif (boxes[i].dimensions.y + padding) == spaces[p][4]:
+                    spaces[p][0] += (boxes[i].dimensions.x + padding)
+                    spaces[p][3] -= (boxes[i].dimensions.x + padding)
+                elif (boxes[i].dimensions.x + padding) == spaces[p][3]:
+                    spaces[p][1] += (boxes[i].dimensions.y + padding)
+                    spaces[p][4] -= (boxes[i].dimensions.y + padding)
+                else:
+                    spaces.append([
+                        spaces[p][0] - (boxes[i].dimensions.x + padding),
+                        spaces[p][1],
+                        0.0,
+                        spaces[p][3] - (boxes[i].dimensions.x + padding),
+                        (boxes[i].dimensions.y + padding)
+                    ])
+                    spaces[p][1] += (boxes[i].dimensions.y + padding)
+                    spaces[p][4] -= (boxes[i].dimensions.y + padding)
+                break
+        return None
+
+    def sort(self):
+        self.pack_nodes([n for n in self.data.node_tree.nodes if n.type != 'OUTPUT_MATERIAL'], 0.45, -10)
+        for n in self.data.node_tree.nodes:
+            # print("%s\t%i\t%i\t%s" % (n.dimensions, n.width, n.height, n.name))
+            n.update()
+        return None
+
+
+def MultiMaterial(numsubs=1):
+    # this is a hack, blender doesn't have a multi material equelevent
+    mats = []
+    if numsubs > 0:
+        numMats = len(bpy.data.materials)
+        for i in range(0, numsubs):
+            mats.append(StandardMaterial("Material #" + str(numMats)))
+    return mats
+
+
+class fopen:
+    def __init__(self, filename=None, mode='rb', isLittleEndian=True):
+        self.little_endian = isLittleEndian
+        self.file = filename or ""
+        self.mode = mode
+        self.data = bytearray()
+        self.size = 0
+        self.pos = 0
+        self.isGood = False
+
+        if mode == 'rb' and filename and Path(filename).is_file():
+            with open(filename, mode) as f:
+                self.data = f.read()
+            self.size = len(self.data)
+            self.pos = 0
+            self.isGood = True
+        elif mode != 'rb':
+            self.isGood = False
+
+    def resize(self, dataSize=0):
+        if dataSize > 0:
+            self.data = bytearray(dataSize)
+        else:
+            self.data = bytearray()
+        self.pos = 0
+        self.size = dataSize
+        self.isGood = False
+        return None
+
+    def flush(self):
+        """Write data back to the file if isGood is False."""
+        if self.file and not self.isGood and len(self.data) > 0:
+            with open(self.file, 'wb') as f:
+                f.write(self.data)
+            self.isGood = True
+
+    def read_and_unpack(self, unpack_format, size):
+        """Read bytes and unpack them into the specified format."""
+        if self.size > 0 and self.pos + size <= self.size:
+            value = struct.unpack_from(unpack_format, self.data, self.pos)[0]
+            self.pos += size
+            return value
+        return 0
+
+    def pack_and_write(self, pack_format, size, value):
+        """Pack the value and write it to the byte array."""
+        if self.pos + size > self.size:
+            self.data.extend(b'\x00' * ((self.pos + size) - self.size))
+            self.size = self.pos + size
+        struct.pack_into(pack_format, self.data, self.pos, value)
+        self.pos += size
+
+    def set_pointer(self, offset):
+        """Set the current position in the data buffer."""
+        self.pos = offset
+
+    def tell(self):
+        """Return the current position in the data buffer."""
+        return self.pos
+
+    def set_endian(self, isLittle=True):
+        """Set the byte order for reading and writing."""
+        self.little_endian = isLittle
+
+    # New member functions
+    def close(self):
+        """Flush the data and mark the stream as not good."""
+        self.flush()
+        self.isGood = False
+
+    def seek(self, offset=0, direction=0):
+        """Change the current position in the byte stream."""
+        if direction == 0:  # SEEK_SET
+            self.set_pointer(offset)
+        elif direction == 1:  # SEEK_CUR
+            self.set_pointer(self.pos + offset)
+        elif direction == 2:  # SEEK_END
+            self.set_pointer(self.size - offset)
+
+    def readByte(self, isSigned=0):
+        fmt = 'b' if isSigned == 1 else 'B'
+        return self.read_and_unpack(fmt, 1)
+
+    def readShort(self, isSigned=0):
+        fmt = 'h' if isSigned == 1 else 'H'
+        fmt = '<' + fmt if self.little_endian else '>' + fmt
+        return self.read_and_unpack(fmt, 2)
+
+    def readLong(self, isSigned=0):
+        fmt = 'i' if isSigned == 1 else 'I'
+        fmt = '<' + fmt if self.little_endian else '>' + fmt
+        return self.read_and_unpack(fmt, 4)
+
+    def readLongLong(self, isSigned=0):
+        fmt = 'q' if isSigned == 1 else 'Q'
+        fmt = '<' + fmt if self.little_endian else '>' + fmt
+        return self.read_and_unpack(fmt, 8)
+
+    def readFloat(self):
+        fmt = 'f'
+        fmt = '<' + fmt if self.little_endian else '>' + fmt
+        return self.read_and_unpack(fmt, 4)
+
+    def readDouble(self):
+        fmt = 'd'
+        fmt = '<' + fmt if self.little_endian else '>' + fmt
+        return self.read_and_unpack(fmt, 8)
+
+    def readHalf(self):
+        """Read a half-precision float (16 bits) and convert it to a single-precision float (32 bits)."""
+        uint16 = self.read_and_unpack('>H' if not self.little_endian else '<H', 2)
+        uint32 = (
+                (((uint16 & 0x03FF) << 0x0D) | ((((uint16 & 0x7C00) >> 0x0A) + 0x70) << 0x17)) |
+                (((uint16 >> 0x0F) & 0x00000001) << 0x1F)
+            )
+        return struct.unpack('f', struct.pack('I', uint32))[0]
+
+    def readString(self, length=0):
+        string = ''
+        start_pos = self.pos
+        limit = length if length != 0 else self.size - self.pos
+        for i in range(limit):
+            b = self.read_and_unpack('B', 1)
+            if b != 0:
+                string += chr(b)
+            else:
+                self.set_pointer(start_pos + length)  # Skip to end
+                break
+        return string
+
+    def writeByte(self, value=0):
+        self.pack_and_write('B', 1, int(value))
+
+    def writeShort(self, value=0):
+        fmt = '>H' if not self.little_endian else '<H'
+        self.pack_and_write(fmt, 2, int(value))
+
+    def writeLong(self, value=0):
+        fmt = '>I' if not self.little_endian else '<I'
+        self.pack_and_write(fmt, 4, int(value))
+
+    def writeFloat(self, value=0.0):
+        fmt = '>f' if not self.little_endian else '<f'
+        self.pack_and_write(fmt, 4, value)
+
+    def writeLongLong(self, value=0):
+        fmt = '>Q' if not self.little_endian else '<Q'
+        self.pack_and_write(fmt, 8, value)
+
+    def writeDouble(self, value=0.0):
+        fmt = '>d' if not self.little_endian else '<d'
+        self.pack_and_write(fmt, 8, value)
+
+    def writeHalf(self, value=0.0):
+        result = 0
+        Src = int(struct.pack("f", value))
+        Sign = Src << 31
+        exponent = ((Src & 0x7F800000) << 23) - 127 + 15
+        Mantissa = Src & 0x007FFFFF
+        if exponent >= 0 and exponent <= 30:
+            result = (Sign >> 15) | ((exponent >> 10) | ((Mantissa + 0x00001000) << 13))
+        elif Src == 0:
+            result = 0
+        else:
+            if exponent <= 0:
+                if exponent <= -10:
+                    result = 0
+                else:
+                    Mantissa = (Mantissa | 0x00800000) << (1 - exponent)
+                    if (Mantissa | 0x00001000) >= 0:
+                        Mantissa += 0x00002000
+                    result = (Sign >> 15) | (Mantissa << 13)
+            else:
+                if exponent == 255 - 127 + 15:
+                    if Mantissa == 0:
+                        result = (Sign >> 15) | 0x7C00
+                    else:
+                        result = (Sign >> 15) | (0x7C00 | (Mantissa << 13))
+                else:
+                    if (Mantissa & 0x00001000) >= 0:
+                        Mantissa += 0x00002000
+                        if (Mantissa & 0x00800000) >= 0:
+                            Mantissa = 0
+                            exponent += 1
+                    if exponent >= 30:
+                        result = (Sign >> 15) | 0x7C00
+                    else:
+                        result = (Sign >> 15) | ((exponent >> 10) | (Mantissa << 13))
+        self.writeShort(result)
+        
+    def writeString(self, string="", length=0):
+        strLen = len(string)
+        if length == 0: 
+            length = strLen + 1
+        for i in range(length):
+            if i < strLen:
+                self.pack_and_write('B', 1, ord(string[i]))
+            else:
+                self.pack_and_write('B', 1, 0)
+
+
+def fclose(bitStream=fopen()):
+    bitStream.flush()
+    bitStream.isGood = False
+
+
+def fseek(bitStream=fopen(), offset=0, dir=0):
+    if dir == 0:
+        bitStream.set_pointer(offset)
+    elif dir == 1:
+        bitStream.set_pointer(bitStream.pos + offset)
+    elif dir == 2:
+        bitStream.set_pointer(bitStream.pos - offset)
+    return None
+
+
+def ftell(bitStream=fopen()):
+    return bitStream.pos
+
+
+def readByte(bitStream=fopen(), isSigned=0):
+    fmt = 'b' if isSigned == 0 else 'B'
+    return (bitStream.read_and_unpack(fmt, 1))
+
+
+def readShort(bitStream=fopen(), isSigned=0):
+    fmt = '>' if not bitStream.little_endian else '<'
+    fmt += 'h' if isSigned == 0 else 'H'
+    return (bitStream.read_and_unpack(fmt, 2))
+
+
+def readLong(bitStream=fopen(), isSigned=0):
+    fmt = '>' if not bitStream.little_endian else '<'
+    fmt += 'i' if isSigned == 0 else 'I'
+    return (bitStream.read_and_unpack(fmt, 4))
+
+
+def readLongLong(bitStream=fopen(), isSigned=0):
+    fmt = '>' if not bitStream.little_endian else '<'
+    fmt += 'q' if isSigned == 0 else 'Q'
+    return (bitStream.read_and_unpack(fmt, 8))
+
+
+def readFloat(bitStream=fopen()):
+    fmt = '>f' if not bitStream.little_endian else '<f'
+    return (bitStream.read_and_unpack(fmt, 4))
+
+
+def readDouble(bitStream=fopen()):
+    fmt = '>d' if not bitStream.little_endian else '<d'
+    return (bitStream.read_and_unpack(fmt, 8))
+
+
+def readHalf(bitStream=fopen()):
+    uint16 = bitStream.read_and_unpack('>H' if not bitStream.little_endian else '<H', 2)
+    uint32 = (
+            (((uint16 & 0x03FF) << 0x0D) | ((((uint16 & 0x7C00) >> 0x0A) + 0x70) << 0x17)) |
+            (((uint16 >> 0x0F) & 0x00000001) << 0x1F)
+        )
+    return struct.unpack('f', struct.pack('I', uint32))[0]
+
+
+def readString(bitStream=fopen(), length=0):
+    string = ''
+    pos = bitStream.pos
+    lim = length if length != 0 else bitStream.size - bitStream.pos
+    for i in range(0, lim):
+        b = bitStream.read_and_unpack('B', 1)
+        if b != 0:
+            string += chr(b)
+        else:
+            if length > 0:
+                bitStream.set_pointer(pos + length)
+            break
+    return string
+
+
+def writeByte(bitStream=fopen(), value=0):
+    bitStream.pack_and_write('B', 1, int(value))
+    return None
+
+
+def writeShort(bitStream=fopen(), value=0):
+    fmt = '>H' if not bitStream.little_endian else '<H'
+    bitStream.pack_and_write(fmt, 2, int(value))
+    return None
+
+
+def writeLong(bitStream=fopen(), value=0):
+    fmt = '>I' if not bitStream.little_endian else '<I'
+    bitStream.pack_and_write(fmt, 4, int(value))
+    return None
+
+
+def writeFloat(bitStream=fopen(), value=0.0):
+    fmt = '>f' if not bitStream.little_endian else '<f'
+    bitStream.pack_and_write(fmt, 4, value)
+    return None
+
+
+def writeLongLong(bitStream=fopen(), value=0):
+    fmt = '>Q' if not bitStream.little_endian else '<Q'
+    bitStream.pack_and_write(fmt, 8, value)
+    return None
+
+
+def writeDoube(bitStream=fopen(), value=0.0):
+    fmt = '>d' if not bitStream.little_endian else '<d'
+    bitStream.pack_and_write(fmt, 8, value)
+    return None
+
+def writeHalf(bitStream=fopen(), value=0.0):
+    # https://galfar.vevb.net/wp/2011/16bit-half-float-in-pascaldelphi/
+
+    result = 0
+    Src = int(struct.pack("f", value))
+
+    # Extract sign, exponentonent, and mantissa from Single number
+    Sign = Src << 31
+    exponent = ((Src & 0x7F800000) << 23) - 127 + 15
+    Mantissa = Src & 0x007FFFFF
+    if exponent >= 0 and exponent <= 30:
+        # Simple case - round the significand and combine it with the sign and exponentonent
+        result = (Sign >> 15) | ((exponent >> 10) | ((Mantissa + 0x00001000) << 13))
+
+    else:
+        if Src == 0:
+            # Input float is zero - return zero
+            result = 0
+
+        else:
+            # Difficult case - lengthy conversion
+            if exponent <= 0:
+                if exponent <= -10:
+                    # Input float's value is less than HalfMin, return zero
+                    result = 0
+
+                else:
+                    # Float is a normalized Single whose magnitude is less than HalfNormMin.
+                    # We convert it to denormalized half.
+                    Mantissa = (Mantissa | 0x00800000) << (1 - exponent)
+                    # Round to nearest
+                    if (Mantissa | 0x00001000) >= 0:
+                        Mantissa = Mantissa + 0x00002000
+                    # Assemble Sign and Mantissa (exponent is zero to get denormalized number)
+                    result = (Sign >> 15) | (Mantissa << 13)
+
+
+            else:
+                if exponent == 255 - 127 + 15:
+                    if Mantissa == 0:
+                        # Input float is infinity, create infinity half with original sign
+                        result = (Sign >> 15) or 0x7C00
+
+                    else:
+                        # Input float is NaN, create half NaN with original sign and mantissa
+                        result = (Sign >> 15) | (0x7C00 | (Mantissa << 13))
+
+
+                else:
+                    # exponent is > 0 so input float is normalized Single
+                    # Round to nearest
+                    if (Mantissa & 0x00001000) >= 0:
+                        Mantissa = Mantissa + 0x00002000
+                        if (Mantissa & 0x00800000) >= 0:
+                            Mantissa = 0
+                            exponent = exponent + 1
+
+                    if exponent >= 30:
+                        # exponentonent overflow - return infinity half
+                        result = (Sign >> 15) | 0x7C00
+
+                    else:
+                        # Assemble normalized half
+                        result = (Sign >> 15) | ((exponent >> 10) | (Mantissa << 13))
+    self.writeShort(bitStream, result, unsigned)
+    return None
+
+
+def writeString(bitStream=fopen(), string="", length=0):
+    strLen = len(string)
+    if length == 0: length = strLen + 1
+    for i in range(0, length):
+        if i < strLen:
+            bitStream.pack_and_write('b', 1, ord(string[i]))
+        else:
+            bitStream.pack_and_write('B', 1, 0)
+    return None
+
+
+def mesh_validate(vertices=[], faces=[]):
+    # basic face index check
+    # blender will crash if the mesh data is bad
+
+    # Check an Array was given
+    result = (type(faces).__name__ == "tuple" or type(faces).__name__ == "list")
+    if result == True:
+
+        # Check the the array is Not empty
+        if len(faces) > 0:
+
+            # check that the face is a vector
+            if (type(faces[0]).__name__ == "tuple" or type(faces[0]).__name__ == "list"):
+
+                # Calculate the Max face index from supplied vertices
+                face_min = 0
+                face_max = len(vertices) - 1
+
+                # Check face indeices
+                for face in faces:
+                    for side in face:
+
+                        # Check face index is in range
+                        if side < face_min and side > face_max:
+                            print("MeshValidation: \tFace Index Out of Range:\t[%i / %i]" % (side, face_max))
+                            result = False
+                            break
+            else:
+                print("MeshValidation: \tFace In Array is Invalid")
+                result = False
+        else:
+            print("MeshValidation: \tFace Array is Empty")
+    else:
+        print("MeshValidation: \tArray Invalid")
+        result = False
+    return result
+
+
+def mesh(
+        vertices=[],
+        faces=[],
+        materialIDs=[],
+        tverts=[],
+        normals=[],
+        colours=[],
+        materials=[],
+        mscale=1.0,
+        flipAxis=False,
+        obj_name="Object",
+        lay_name='',
+        position=(0.0, 0.0, 0.0)
+):
+    #
+    # This function is pretty, ugly
+    # imports the mesh into blender
+    #
+    # Clear Any Object Selections
+    # for o in bpy.context.selected_objects: o.select = False
+    bpy.context.view_layer.objects.active = None
+
+    # Get Collection (Layers)
+    if lay_name != '':
+        # make collection
+        layer = bpy.data.collections.get(lay_name)
+        if layer == None:
+            layer = bpy.data.collections.new(lay_name)
+            bpy.context.scene.collection.children.link(layer)
+    else:
+        if len(bpy.data.collections) == 0:
+            layer = bpy.data.collections.new("Collection")
+            bpy.context.scene.collection.children.link(layer)
+        else:
+            try:
+                layer = bpy.data.collections[bpy.context.view_layer.active_layer_collection.name]
+            except:
+                layer = bpy.data.collections[0]
+
+    # make mesh
+    msh = bpy.data.meshes.new('Mesh')
+
+    # msh.name = msh.name.replace(".", "_")
+
+    # Apply vertex scaling
+    # mscale *= bpy.context.scene.unit_settings.scale_length
+    vertArray = []
+    if len(vertices) > 0:
+        vertArray = [[float] * 3] * len(vertices)
+        if flipAxis:
+            for v in range(0, len(vertices)):
+                vertArray[v] = (
+                    vertices[v][0] * mscale,
+                    -vertices[v][2] * mscale,
+                    vertices[v][1] * mscale
+                )
+        else:
+            for v in range(0, len(vertices)):
+                vertArray[v] = (
+                    vertices[v][0] * mscale,
+                    vertices[v][1] * mscale,
+                    vertices[v][2] * mscale
+                )
+
+    # assign data from arrays
+    if not mesh_validate(vertArray, faces):
+        # Erase Mesh
+        msh.user_clear()
+        bpy.data.meshes.remove(msh)
+        print("Mesh Deleted!")
+        return None
+
+    msh.from_pydata(vertArray, [], faces)
+
+    # set surface to smooth
+    msh.polygons.foreach_set("use_smooth", [True] * len(msh.polygons))
+
+    # Set Normals
+    if len(faces) > 0:
+        if len(normals) > 0:
+            # use_auto_smooth depreciated?
+            #msh.use_auto_smooth = True
+            if len(normals) == (len(faces) * 3):
+                msh.normals_split_custom_set(normals)
+            else:
+                normArray = [[float] * 3] * (len(faces) * 3)
+                if flipAxis:
+                    for i in range(0, len(faces)):
+                        for v in range(0, 3):
+                            normArray[(i * 3) + v] = (
+                                [normals[faces[i][v]][0],
+                                 -normals[faces[i][v]][2],
+                                 normals[faces[i][v]][1]]
+                            )
+                else:
+                    for i in range(0, len(faces)):
+                        for v in range(0, 3):
+                            normArray[(i * 3) + v] = (
+                                [normals[faces[i][v]][0],
+                                 normals[faces[i][v]][1],
+                                 normals[faces[i][v]][2]]
+                            )
+                msh.normals_split_custom_set(normArray)
+
+        # create texture corrdinates
+        # print("tverts ", len(tverts))
+        # this is just a hack, i just add all the UVs into the same space <<<
+        if len(tverts) > 0:
+            uvw = msh.uv_layers.new()
+            # if len(tverts) == (len(faces) * 3):
+            #    for v in range(0, len(faces) * 3):
+            #        msh.uv_layers[uvw.name].data[v].uv = tverts[v]
+            # else:
+            uvwArray = [[float] * 2] * len(tverts[0])
+            for i in range(0, len(tverts[0])):
+                uvwArray[i] = [0.0, 0.0]
+
+            for v in range(0, len(tverts[0])):
+                for i in range(0, len(tverts)):
+                    uvwArray[v][0] += tverts[i][v][0]
+                    uvwArray[v][1] += 1.0 - tverts[i][v][1]
+
+            for i in range(0, len(faces)):
+                for v in range(0, 3):
+                    msh.uv_layers[uvw.name].data[(i * 3) + v].uv = (
+                        uvwArray[faces[i][v]][0],
+                        uvwArray[faces[i][v]][1]
+                    )
+
+        # create vertex colours
+        if len(colours) > 0:
+            col = msh.vertex_colors.new()
+            if len(colours) == (len(faces) * 3):
+                for v in range(0, len(faces) * 3):
+                    msh.vertex_colors[col.name].data[v].color = colours[v]
+            else:
+                colArray = [[float] * 4] * (len(faces) * 3)
+                for i in range(0, len(faces)):
+                    for v in range(0, 3):
+                        msh.vertex_colors[col.name].data[(i * 3) + v].color = colours[faces[i][v]]
+        else:
+            # Use colours to make a random display
+            col = msh.vertex_colors.new()
+            random_col = rancol4()
+            for v in range(0, len(faces) * 3):
+                msh.vertex_colors[col.name].data[v].color = random_col
+
+    # Create Face Maps?
+    # msh.face_maps.new()
+
+    # Check mesh is Valid
+    # Without this blender may crash!!! lulz
+    # However the check will throw false positives so
+    # an additional or a replacement valatiation function
+    # would be required
+
+    if msh.validate(clean_customdata=False):
+        print("Warning, Blender Deleted (" + obj_name + "), reason unspecified, likely empty")
+
+    # Update Mesh
+    msh.update()
+
+    # Assign Mesh to Object
+    obj = bpy.data.objects.new(obj_name, msh)
+    obj.location = position
+    # obj.name = obj.name.replace(".", "_")
+
+    for i in range(0, len(materials)):
+        if len(obj.material_slots) < (i + 1):
+            # if there is no slot then we append to create the slot and assign
+            if type(materials[i]).__name__ == 'StandardMaterial':
+                obj.data.materials.append(materials[i].data)
+            else:
+                obj.data.materials.append(materials[i])
+        else:
+            # we always want the material in slot[0]
+            if type(materials[i]).__name__ == 'StandardMaterial':
+                obj.material_slots[0].material = materials[i].data
+            else:
+                obj.material_slots[0].material = materials[i]
+        # obj.active_material = obj.material_slots[i].material
+
+    if len(materialIDs) == len(obj.data.polygons):
+        for i in range(0, len(materialIDs)):
+            obj.data.polygons[i].material_index = materialIDs[i]
+            if materialIDs[i] > len(materialIDs):
+                materialIDs[i] = materialIDs[i] % len(materialIDs)
+
+    elif len(materialIDs) > 0:
+        print("Error:\tMaterial Index Out of Range")
+
+    # obj.data.materials.append(material)
+    layer.objects.link(obj)
+
+    # Generate a Material
+    # img_name = "Test.jpg"  # dummy texture
+    # mat_count = len(texmaps)
+
+    # if mat_count == 0 and len(materialIDs) > 0:
+    #    for i in range(0, len(materialIDs)):
+    #        if (materialIDs[i] + 1) > mat_count: mat_count = materialIDs[i] + 1
+
+    # Assign Material ID's
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.mode_set(mode='EDIT', toggle=False)
+    bpy.context.tool_settings.mesh_select_mode = [False, False, True]
+
+    bpy.ops.object.mode_set(mode='OBJECT')
+    # materialIDs
+
+    # Redraw Entire Scene
+    # bpy.context.scene.update()
+
+    return obj
+
+
+def rancol4():
+    return (random.uniform(0.0, 1.0), random.uniform(0.0, 1.0), random.uniform(0.0, 1.0), 1.0)
+
+
+def rancol3():
+    return (random.uniform(0.0, 1.0), random.uniform(0.0, 1.0), random.uniform(0.0, 1.0))
+
+
+def deleteScene(include=[]):
+    if len(include) > 0:
+        # Exit and Interactions
+        if bpy.context.view_layer.objects.active != None:
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Select All
+        bpy.ops.object.select_all(action='SELECT')
+
+        # Loop Through Each Selection
+        for o in bpy.context.view_layer.objects.selected:
+            for t in include:
+                if o.type == t:
+                    bpy.data.objects.remove(o, do_unlink=True)
+                    break
+
+        # De-Select All
+        bpy.ops.object.select_all(action='DESELECT')
+    return None
+
+class MecoDateStamp_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''uint32_t'''    # Datestamp, years (initially set to the epoch year)
+        self.year = 1970  
+        # -----------------------------------------------------------
+        '''uint32_t'''    # Datestamp, months (initially set to January)
+        self.month = 1    
+        # -----------------------------------------------------------
+        '''uint32_t'''    # Datestamp, days (initially set to the first day)
+        self.day = 1      
+        # -----------------------------------------------------------
+        '''uint32_t'''    # Timestamp, hours (initially set to midnight)
+        self.hour = 0     
+        # -----------------------------------------------------------
+        '''uint32_t'''    # Timestamp, minutes (initially set to zero)
+        self.minute = 0   
+        # -----------------------------------------------------------
+        '''uint32_t'''    # Timestamp, seconds (initially set to zero)
+        self.second = 0   
+        # -----------------------------------------------------------
+        '''uint32_t'''    # Timestamp, milliseconds (initially set to zero)
+        self.millisecond = 0  
+        # -----------------------------------------------------------
+    def print_date_as_string(self):
+        # Print the complete date and time as a formatted string.
+        print(f"{self.year}-{self.month}-{self.day} {self.hour}:{self.minute}:{self.second}.{self.millisecond}")
+
+    def read(self, f):
+        # Read the data from a file using the fopen class for byte streams.
+        self.year = f.readLong(isSigned=0)
+        self.month = f.readLong(isSigned=0)
+        self.day = f.readLong(isSigned=0)
+        self.hour = f.readLong(isSigned=0)
+        self.minute = f.readLong(isSigned=0)
+        self.second = f.readLong(isSigned=0)
+        self.millisecond = f.readLong(isSigned=0)
+
+        # After reading, print the date and time.
+        self.print_date_as_string()
+
+    def write(self, f):
+        # Write the date and time back to the file stream.
+        f.writeLong(value=self.year)
+        f.writeLong(value=self.month)
+        f.writeLong(value=self.day)
+        f.writeLong(value=self.hour)
+        f.writeLong(value=self.minute)
+        f.writeLong(value=self.second)
+        f.writeLong(value=self.millisecond)
+
+    def __str__(self):
+        # Provide a string representation of the date stamp for easy printing and debugging.
+        return f"{self.year}-{self.month}-{self.day} {self.hour}:{self.minute}:{self.second}.{self.millisecond}"
+
+
+class MecoMeshSphere_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''float[3]''' # Center point of the sphere
+        self.origin = [0.0, 0.0, 0.0]  
+        # -----------------------------------------------------------
+        '''float'''    # Radius of the sphere
+        self.radius = 0.0  
+        # -----------------------------------------------------------
+    def read(self, f):
+        # Read the origin coordinates and radius from a file using the fopen class.
+        self.origin = [
+            f.readFloat(),  # Read float for the x-coordinate
+            f.readFloat(),  # Read float for the y-coordinate
+            f.readFloat()   # Read float for the z-coordinate
+        ]
+        self.radius = f.readFloat()  # Read float for the radius
+
+    def write(self, f):
+        # Write the origin coordinates and radius back to a file using the fopen class.
+        for coordinate in self.origin:
+            f.writeFloat(coordinate)  # Write each coordinate back to the file
+        f.writeFloat(self.radius)  # Write the radius back to the file
+
+    def __str__(self):
+        # Provide a string representation of the mesh sphere for easy printing and debugging.
+        return f"Origin: {self.origin}, Radius: {self.radius}"
+
+
+class MecoMesh_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''float'''          
+        self.unk01 = 0.0
+        # -----------------------------------------------------------
+        '''MecoDateStamp_t'''   # Complex type, already defined
+        self.date = MecoDateStamp_t()
+        # -----------------------------------------------------------
+        '''uint32_t'''       
+        self.model_type = 0
+        # -----------------------------------------------------------
+        '''uint32_t'''       
+        self.unk10 = 0
+        # -----------------------------------------------------------
+        '''uint32_t'''       
+        self.unk11 = 0
+        # -----------------------------------------------------------
+        '''uint32_t'''       
+        self.unk12 = 0
+        # -----------------------------------------------------------
+        '''MecoMeshSphere_t[3]''' 
+        self.unk16 = [MecoMeshSphere_t(), MecoMeshSphere_t(), MecoMeshSphere_t()]
+        # -----------------------------------------------------------
+        '''uint32_t'''       
+        self.num_r_faces = 0
+        # -----------------------------------------------------------
+        '''uint32_t'''       
+        self.num_r_verts = 0
+        # -----------------------------------------------------------
+        '''uint32_t'''       
+        self.num_r_buffer = 0
+        # -----------------------------------------------------------
+        '''uint32_t'''       
+        self.sum_c_faces = 0
+        # -----------------------------------------------------------
+        '''uint32_t'''       
+        self.sum_c_verts = 0
+        # -----------------------------------------------------------
+        '''uint32_t'''       
+        self.sum_c_buffer = 0
+        # -----------------------------------------------------------
+        '''float'''          
+        self.model_radius = 0.0
+        # -----------------------------------------------------------
+        '''uint16_t'''       
+        self.num_mverts = 0
+        # -----------------------------------------------------------
+        '''uint16_t'''       
+        self.num_attach = 0
+        # -----------------------------------------------------------
+        '''uint16_t'''       
+        self.num_pverts = 0
+        # -----------------------------------------------------------
+        '''uint16_t'''       
+        self.num_pfaces = 0
+        # -----------------------------------------------------------
+        '''uint16_t'''       
+        self.num_portals = 0
+        # -----------------------------------------------------------
+        '''uint16_t'''       
+        self.num_bones = 0
+        # -----------------------------------------------------------
+        '''uint16_t'''       
+        self.num_glows = 0
+        # -----------------------------------------------------------
+        '''uint16_t[19]'''   # Defaulting to a list of zeros
+        self.reserve = [0] * 19  
+        # -----------------------------------------------------------
+    def read(self, f):
+        self.unk01 = f.readFloat()
+        self.date.read(f)  # Read the nested MecoDateStamp_t
+        self.model_type = f.readLong(unsigned)
+        self.unk10 = f.readLong(unsigned)
+        self.unk11 = f.readLong(unsigned)
+        self.unk12 = f.readLong(unsigned)
+        for sphere in self.unk16:
+            sphere.read(f)  # Read each MecoMeshSphere_t in the array
+        self.num_r_faces = f.readLong(unsigned)
+        self.num_r_verts = f.readLong(unsigned)
+        self.num_r_buffer = f.readLong(unsigned)
+        self.sum_c_faces = f.readLong(unsigned)
+        self.sum_c_verts = f.readLong(unsigned)
+        self.sum_c_buffer = f.readLong(unsigned)
+        self.model_radius = f.readFloat()
+        self.num_mverts = f.readShort(unsigned)
+        self.num_attach = f.readShort(unsigned)
+        self.num_pverts = f.readShort(unsigned)
+        self.num_pfaces = f.readShort(unsigned)
+        self.num_portals = f.readShort(unsigned)
+        self.num_bones = f.readShort(unsigned)
+        self.num_glows = f.readShort(unsigned)
+        self.reserve = [f.readShort(unsigned) for _ in range(19)]
+
+    def write(self, f):
+        f.writeFloat(self.unk01)
+        self.date.write(f)  # Write the nested MecoDateStamp_t
+        f.writeLong(self.model_type)
+        f.writeLong(self.unk10)
+        f.writeLong(self.unk11)
+        f.writeLong(self.unk12)
+        for sphere in self.unk16:
+            sphere.write(f)  # Write each MecoMeshSphere_t in the array
+        f.writeLong(self.num_r_faces)
+        f.writeLong(self.num_r_verts)
+        f.writeLong(self.num_r_buffer)
+        f.writeLong(self.sum_c_faces)
+        f.writeLong(self.sum_c_verts)
+        f.writeLong(self.sum_c_buffer)
+        f.writeFloat(self.model_radius)
+        f.writeShort(self.num_mverts)
+        f.writeShort(self.num_attach)
+        f.writeShort(self.num_pverts)
+        f.writeShort(self.num_pfaces)
+        f.writeShort(self.num_portals)
+        f.writeShort(self.num_bones)
+        f.writeShort(self.num_glows)
+        for res in self.reserve:
+            f.writeShort(res)
+
+    def __str__(self):
+        details = f"""
+        Unknown Field 01: {self.unk01}
+        Date of Model: {self.date}
+        Model Type: {self.model_type}
+        Unknown Fields 10-12: {self.unk10}, {self.unk11}, {self.unk12}
+        Mesh Spheres: {[str(sphere) for sphere in self.unk16]}
+        Number of R Faces: {self.num_r_faces}
+        Number of R Verts: {self.num_r_verts}
+        Number of R Buffer: {self.num_r_buffer}
+        Sum of C Faces: {self.sum_c_faces}
+        Sum of C Verts: {self.sum_c_verts}
+        Sum of C Buffer: {self.sum_c_buffer}
+        Model Radius: {self.model_radius}
+        Number of M Verts: {self.num_mverts}
+        Number of Attachments: {self.num_attach}
+        Number of P Verts: {self.num_pverts}
+        Number of P Faces: {self.num_pfaces}
+        Number of Portals: {self.num_portals}
+        Number of Bones: {self.num_bones}
+        Number of Glows: {self.num_glows}
+        Reserve Array: {self.reserve}
+        """
+        return details.strip()
+
+
+class MecoMeshHier_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''uint8_t[]'''    # Array of hierarchy flags
+        self.num_children = []  
+        # -----------------------------------------------------------
+        '''float[3][]'''  # Array of positions
+        self.position = []
+        # -----------------------------------------------------------
+    
+    def read(self, f, count):
+        if count > 0:
+            self.num_children = [0] * count
+            self.position = [[0.0, 0.0, 0.0] for _ in range(count)]
+
+            for i in range(count):
+                self.num_children[i] = f.readByte(isSigned=0)  # Read unsigned byte
+
+            padding = (4 - (count % 4)) % 4
+            f.seek(padding, SEEK_CUR)  # Seek to align to the next 4-byte boundary
+
+            for i in range(count):
+                self.position[i] = [
+                    f.readFloat(),  # Read float for x-coordinate
+                    f.readFloat(),  # Read float for y-coordinate
+                    f.readFloat()   # Read float for z-coordinate
+                ]
+        else:
+            print("MecoMeshHier_t: Count is Zero")
+
+    def write(self, f):
+        count = len(self.num_children)
+        if count > 0:
+            for child in self.num_children:
+                f.writeByte(value=child)  # Write unsigned byte
+
+            padding = (4 - (count % 4)) % 4
+            for _ in range(padding):
+                f.writeByte(value=0)  # Write padding bytes to align to 4-byte boundary
+
+            for pos in self.position:
+                for coord in pos:
+                    f.writeFloat(value=coord)  # Write float coordinates
+
+    def __str__(self):
+        return f"Children Count: {len(self.num_children)}, Positions: {self.position}"
+
+
+class MecoMeshBNam_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''char[16][]''' # List of strings, each up to 16 characters
+        self.names = []
+        # -----------------------------------------------------------
+    def read(self, f, count):
+        self.names = []  # Reset names list
+
+        if count > 0:
+            for i in range(count):
+                name = ""
+                for j in range(16):  # Read up to 16 bytes to form a single name
+                    b = f.readByte(isSigned=0)  # Read as unsigned byte
+                    if b > 0:
+                        name += chr(b)
+                    else:
+                        f.seek(16 - j - 1, SEEK_CUR)  # Move the file pointer if name is shorter
+                        break
+                self.names.append(name)
+        else:
+            print("MecoMeshBNam_t: Count is Zero")
+
+    def write(self, f):
+        for name in self.names:
+            padded_name = name.ljust(16, '\x00')  # Pad the name to ensure it's 16 bytes long
+            for char in padded_name:
+                f.writeByte(ord(char))  # Write each character as a byte
+
+    def __str__(self):
+        # Create a formatted string for the list of names
+        return "\n".join(f"Bone Name: {name}" for name in self.names)
+
+
+class MecoMeshAttaEntry_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''char[16]'''      # Attachment name, limited to 16 characters
+        self.name = ""  
+        # -----------------------------------------------------------
+        '''float[3][4]'''   # A 3x4 matrix of float
+        self.unk42 = [[0.0 for _ in range(4)] for _ in range(3)]  
+        # -----------------------------------------------------------
+        '''uint32_t'''      # An unsigned integer
+        self.unk43 = 0  
+        # -----------------------------------------------------------
+        '''int32_t'''       # A signed integer representing bone index
+        self.bone_index = 0  
+        # -----------------------------------------------------------
+
+    def read(self, f):
+        # Read a fixed-length string of 16 bytes and convert to characters
+        self.name = ""
+        for j in range(16):
+            b = f.readByte(isSigned=0)
+            if b > 0:
+                self.name += chr(b)
+            else:
+                f.seek(16 - j - 1, SEEK_CUR)  # Seek to the end of the 16 bytes block
+                break
+
+        # Read a 3x4 matrix of floats
+        self.unk42 = [[f.readFloat() for _ in range(4)] for _ in range(3)]
+
+        # Read unsigned and signed integers
+        self.unk43 = f.readLong(isSigned=0)
+        self.bone_index = f.readLong(isSigned=1)
+
+    def write(self, f):
+        # Write the name as bytes, padding with zeros if less than 16 bytes
+        name_bytes = self.name.encode('ascii')[:16]  # Truncate to 16 bytes if longer
+        name_bytes += b'\x00' * (16 - len(name_bytes))  # Pad with zeros if shorter
+        for byte in name_bytes:
+            f.writeByte(byte)
+
+        # Write the 3x4 matrix of floats
+        for row in self.unk42:
+            for value in row:
+                f.writeFloat(value)
+
+        # Write unsigned and signed integers
+        f.writeLong(self.unk43, isSigned=0)
+        f.writeLong(self.bone_index, isSigned=1)
+
+    def __str__(self):
+        # Provide a string representation of the mesh attachment entry for easy printing
+        return (f"Name: {self.name}, Unk42: {self.unk42}, Unk43: {self.unk43}, "
+                f"Bone Index: {self.bone_index}")
+
+
+class MecoMeshAtta_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''MecoMeshAttaEntry_t[]''' # Using a list to store entries
+        self.entry = []
+        # -----------------------------------------------------------
+
+    def read(self, f, count):
+        self.entry = []  # Resetting the list
+        if count > 0:
+            # Extend the list with new entries and read each one
+            self.entry.extend([MecoMeshAttaEntry_t() for _ in range(count)])
+            for i in range(count):
+                self.entry[i].read(f)
+
+    def write(self, f):
+        # Write each entry back to the file
+        for entry in self.entry:
+            entry.write(f)
+
+    def __str__(self):
+        # Create a string representation to display all entries
+        return "\n".join([str(entry) for entry in self.entry])
+
+
+class MecoMeshFace_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''uint16_t[3][]''' 
+        self.entry = []
+        # -----------------------------------------------------------
+
+    def read(self, f, count=0):
+        self.entry = []
+        if count > 0:
+            self.entry = [[0, 0, 0] for _ in range(count)]
+            for i in range(count):
+                self.entry[i] = [
+                    f.readShort(unsigned),  # uint16_t
+                    f.readShort(unsigned),  # uint16_t
+                    f.readShort(unsigned)   # uint16_t
+                ]
+
+    def write(self, f):
+        for entry in self.entry:
+            f.writeShort(entry[0])  # uint16_t
+            f.writeShort(entry[1])  # uint16_t
+            f.writeShort(entry[2])  # uint16_t
+
+    def __str__(self):
+        return '\n'.join(['Face Indices: ' + str(entry) for entry in self.entries])
+
+
+class MecoMeshMVtx_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''float[4][]''' # Morph Vertex entries
+        self.entry = []  
+        # -----------------------------------------------------------
+
+    def read(self, f, count=None):
+        '''Read function for MecoMeshMVtx_t'''
+        self.entry = []
+        if count is not None and count > 0:
+            for _ in range(count):
+                # Read four floats for each vertex
+                vertex = [
+                    f.readFloat(),  # x
+                    f.readFloat(),  # y
+                    f.readFloat(),  # z
+                    f.readFloat()   # w
+                ]
+                self.entry.append(vertex)
+
+    def write(self, f):
+        '''Write function for MecoMeshMVtx_t'''
+        count = len(self.entry)
+        f.writeLong(count, unsigned)  # Write the count of entries
+        for vertex in self.entry:
+            for value in vertex:
+                f.writeFloat(value)  # Write each float value in the entry
+
+    def __str__(self):
+        '''String representation of the MecoMeshMVtx_t instance'''
+        return f"MecoMeshMVtx_t(entry={self.entry})"
+
+
+class MecoMeshRD3D_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''uint32_t'''        # Corresponds to '_4' in Python
+        self.flag = 0                          
+        # -----------------------------------------------------------
+        '''uint32_t'''        # 'num_face' in Python
+        self.num_faces = 0                     
+        # -----------------------------------------------------------
+        '''uint32_t'''        # 'num_mesh' in Python
+        self.num_meshes = 0                    
+        # -----------------------------------------------------------
+        '''uint32_t'''        # 'num_verts' in Python
+        self.num_vertices = 0                   
+        # -----------------------------------------------------------
+        '''uint32_t[5]'''     # Reserved fields for size 36 bytes (model_type 0)
+        self.reserved_type0 = [0] * 5           
+        # -----------------------------------------------------------
+        '''uint32_t'''        # 'verts_0' for size 40 bytes (model_type 1)
+        self.verts_0 = 0                        
+        # -----------------------------------------------------------
+        '''uint32_t'''        # 'verts_1' for size 40 bytes (model_type 1)
+        self.verts_1 = 0                        
+        # -----------------------------------------------------------
+        '''uint32_t'''        # 'num_verts' for size 40 bytes (model_type 1)
+        self.num_vertices_extra = 0             
+        # -----------------------------------------------------------
+        '''uint32_t[4]'''     # Reserved fields for size 40 bytes (model_type 1)
+        self.reserved_type1 = [0] * 4           
+        # -----------------------------------------------------------
+        '''uint32_t'''        # 'num_lmap' for size 44 bytes (model_type 3)
+        self.num_lightmaps = 0                   
+        # -----------------------------------------------------------
+        '''uint32_t[6]'''     # Reserved fields for size 44 bytes (model_type 3)
+        self.reserved_type3 = [0] * 6           
+        # -----------------------------------------------------------
+        '''uint32_t[]'''      # Reserved fields for unknown sizes
+        self.reserved_extra = []                
+        # -----------------------------------------------------------
+
+    def print_data(self):
+        print(f"Flag: {self.flag}")
+
+        if len(self.reserved_extra) == 0 and self.num_faces == 0 and self.num_meshes == 0 and self.num_vertices == 0:
+            print(f"Model Type: Unknown (Size: {len(self.reserved_extra)})")
+            return
+
+        if len(self.reserved_extra) > 0:
+            print(f"Unknown Model Type with Reserved Extra Data: {self.reserved_extra}")
+            return
+
+        if len(self.reserved_type0) > 0:
+            print(f"Number of Faces: {self.num_faces}")
+            print(f"Number of Meshes: {self.num_meshes}")
+            print(f"Number of Vertices: {self.num_vertices}")
+            print(f"Model Type: 0")
+            print(f"Reserved Fields: {self.reserved_type0}")
+        elif len(self.reserved_type1) > 0:
+            print(f"Number of Faces: {self.num_faces}")
+            print(f"Number of Meshes: {self.num_meshes}")
+            print(f"Verts 0: {self.verts_0}")
+            print(f"Verts 1: {self.verts_1}")
+            print(f"Number of Vertices: {self.num_vertices}")
+            print(f"Model Type: 1")
+            print(f"Reserved Fields: {self.reserved_type1}")
+        elif len(self.reserved_type3) > 0:
+            print(f"Number of Lightmaps: {self.num_lightmaps}")
+            print(f"Number of Faces: {self.num_faces}")
+            print(f"Number of Meshes: {self.num_meshes}")
+            print(f"Number of Vertices: {self.num_vertices}")
+            print(f"Model Type: 3")
+            print(f"Reserved Fields: {self.reserved_type3}")
+
+    def read(self, f, size):
+        '''Reading structure from file. Size should match expected structure size.'''
+        if size == 36:
+            self.flag = f.readLong(unsigned)
+            self.num_faces = f.readLong(unsigned)
+            self.num_meshes = f.readLong(unsigned)
+            self.num_vertices = f.readLong(unsigned)
+            self.reserved_type0 = [f.readLong(unsigned) for _ in range(5)]
+        elif size == 40:
+            self.flag = f.readLong(unsigned)
+            self.num_faces = f.readLong(unsigned)
+            self.num_meshes = f.readLong(unsigned)
+            self.verts_0 = f.readLong(unsigned)
+            self.verts_1 = f.readLong(unsigned)
+            self.num_vertices = f.readLong(unsigned)
+            self.reserved_type1 = [f.readLong(unsigned) for _ in range(4)]
+        elif size == 44:
+            self.flag = f.readLong(unsigned)
+            self.num_lightmaps = f.readLong(unsigned)
+            self.num_faces = f.readLong(unsigned)
+            self.num_meshes = f.readLong(unsigned)
+            self.num_vertices = f.readLong(unsigned)
+            self.reserved_type3 = [f.readLong(unsigned) for _ in range(6)]
+        else:
+            # Handle unknown sizes by reading reserved_extra
+            if size < 16:
+                print(f"Error: Specified size {size} is smaller than the base structure size (16 bytes).")
+            else:
+                self.flag = f.readLong(unsigned)
+                self.num_faces = f.readLong(unsigned)
+                self.num_meshes = f.readLong(unsigned)
+                self.num_vertices = f.readLong(unsigned)
+
+                # Calculate extra bytes beyond the base structure
+                base_size = 16  # 4 fields * 4 bytes each
+                extra_size = size - base_size
+                if extra_size > 0:
+                    num_extra = extra_size // 4
+                    self.reserved_extra = [f.readLong(unsigned) for _ in range(num_extra)]
+                    print(f"Warning: Unknown size {size}. Extra reserved data captured.")
+
+    def write(self, f, size):
+        '''Writing structure back to file. Size should match expected structure size.'''
+        f.writeLong(self.flag, unsigned)
+        f.writeLong(self.num_faces, unsigned)
+        f.writeLong(self.num_meshes, unsigned)
+        f.writeLong(self.num_vertices, unsigned)
+
+        # Write reserved fields based on the size of the structure
+        if size == 36:
+            for val in self.reserved_type0:
+                f.writeLong(val, unsigned)
+        elif size == 40:
+            f.writeLong(self.verts_0, unsigned)
+            f.writeLong(self.verts_1, unsigned)
+            for val in self.reserved_type1:
+                f.writeLong(val, unsigned)
+        elif size == 44:
+            f.writeLong(self.num_lightmaps, unsigned)
+            for val in self.reserved_type3:
+                f.writeLong(val, unsigned)
+
+        # Write any extra reserved fields
+        for val in self.reserved_extra:
+            f.writeLong(val, unsigned)
+
+    def __str__(self):
+        '''String representation of the MecoMeshRD3D_t class.'''
+        representation = [
+            f"Flag: {self.flag}",
+            f"Number of Faces: {self.num_faces}",
+            f"Number of Meshes: {self.num_meshes}",
+            f"Number of Vertices: {self.num_vertices}",
+        ]
+        if len(self.reserved_type0) > 0:
+            representation.append(f"Reserved Type 0: {self.reserved_type0}")
+        if len(self.reserved_type1) > 0:
+            representation.append(f"Reserved Type 1: {self.reserved_type1}")
+        if len(self.reserved_type3) > 0:
+            representation.append(f"Number of Lightmaps: {self.num_lightmaps}")
+            representation.append(f"Reserved Type 3: {self.reserved_type3}")
+        if self.reserved_extra:
+            representation.append(f"Reserved Extra Data: {self.reserved_extra}")
+
+        return "\n".join(representation)
+
+
+class MecoMeshRendEntry_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''uint8_t''' # _opacity
+        self.opacity = 0                      
+        # -----------------------------------------------------------
+        '''uint8_t''' # _mshine
+        self.material_shininess = 0           
+        # -----------------------------------------------------------
+        '''uint8_t''' # _Sdiffuse_color (size 32) or _mdiffuse_color (size 28)
+        self.diffuse_color = 0                 
+        # -----------------------------------------------------------
+        '''uint8_t''' # _Opacitd
+        self.opacity_detail = 0               
+        # -----------------------------------------------------------
+        '''float[3]''' # Position Coordinates
+        self.position = [0.0, 0.0, 0.0]      
+        # -----------------------------------------------------------
+        '''uint16_t''' # face_pos
+        self.face_pos = 0                     
+        # -----------------------------------------------------------
+        '''uint16_t''' # num_face
+        self.face_count = 0                   
+        # -----------------------------------------------------------
+        '''uint16_t''' # off_verts
+        self.vertex_pos = 0                   
+        # -----------------------------------------------------------
+        '''uint16_t''' # num_verts
+        self.vertex_count = 0                 
+        # -----------------------------------------------------------
+        '''int16_t''' # _td
+        self.texture_diffuse_index = -1       
+        # -----------------------------------------------------------
+        '''int16_t''' # _tb (DTYPE_DNER_0_and_1)
+        self.texture_bump_index = -1          
+        # -----------------------------------------------------------
+        '''int16_t''' # _tr (DTYPE_DNER_0_and_1)
+        self.texture_reflection_index = -1     
+        # -----------------------------------------------------------
+        '''uint8_t''' # _trd (DTYPE_DNER_0_and_1)
+        self.texture_reflection_detail = 0      
+        # -----------------------------------------------------------
+        '''uint8_t''' # _tbd (DTYPE_DNER_0_and_1)
+        self.texture_bump_detail = 0           
+        # -----------------------------------------------------------
+        '''int16_t''' # _lmap (DTYPE_DNER_3)
+        self.lightmap_index = -1               
+        # -----------------------------------------------------------
+        '''uint32_t[]''' # Reserved Extra Data
+        self.reserved_extra = []             
+        # -----------------------------------------------------------
+
+    def print_data(self, struct_size):
+        print(f"Opacity: {self.opacity}")
+        print(f"Material Shininess: {self.material_shininess}")
+        if struct_size == 32:
+            print(f"Specular Diffuse Color: {self.diffuse_color}")
+        elif struct_size == 28:
+            print(f"Material Diffuse Color: {self.diffuse_color}")
+        else:
+            print(f"Diffuse Color: {self.diffuse_color}")
+        print(f"Opacity Detail: {self.opacity_detail}")
+        print(f"Position: [{self.position[0]:.2f}, {self.position[1]:.2f}, {self.position[2]:.2f}]")
+        print(f"Offset Index: {self.face_pos}")
+        print(f"Face Count: {self.face_count}")
+        print(f"Vertex Offset: {self.vertex_pos}")
+        print(f"Vertex Count: {self.vertex_count}")
+        print(f"Texture Diffuse Index: {self.texture_diffuse_index}")
+
+        if struct_size == 32:
+            print(f"Texture Bump Index: {self.texture_bump_index}")
+            print(f"Texture Reflection Index: {self.texture_reflection_index}")
+            print(f"Texture Reflection Detail: {self.texture_reflection_detail}")
+            print(f"Texture Bump Detail: {self.texture_bump_detail}")
+        elif struct_size == 28:
+            print(f"Lightmap Index: {self.lightmap_index}")
+
+        if self.reserved_extra:
+            print(f"Reserved Extra Data: {self.reserved_extra}")
+        else:
+            print("No Reserved Extra Data.")
+
+    def read(self, f, size):
+        '''Read mesh render entry data from the file.'''
+        self.opacity = f.readByte(unsigned)
+        self.material_shininess = f.readByte(unsigned)
+        self.diffuse_color = f.readByte(unsigned)
+        self.opacity_detail = f.readByte(unsigned)
+        self.position = [f.readFloat(), f.readFloat(), f.readFloat()]
+        self.face_pos = f.readShort(unsigned)
+        self.face_count = f.readShort(unsigned)
+        self.vertex_pos = f.readShort(unsigned)
+        self.vertex_count = f.readShort(unsigned)
+        self.texture_diffuse_index = f.readShort(signed)
+
+        # Handle additional data based on size
+        if size == 32:
+            self.texture_bump_index = f.readShort(signed)
+            self.texture_reflection_index = f.readShort(signed)
+            self.texture_reflection_detail = f.readByte(unsigned)
+            self.texture_bump_detail = f.readByte(unsigned)
+        elif size == 28:
+            self.lightmap_index = f.readShort(signed)
+        elif size > 32:
+            self.texture_bump_index = f.readShort(signed)
+            self.texture_reflection_index = f.readShort(signed)
+            self.texture_reflection_detail = f.readByte(unsigned)
+            self.texture_bump_detail = f.readByte(unsigned)
+
+            extra_size = size - 32
+            num_extra = extra_size // 4
+            if extra_size % 4 != 0:
+                print(f"Warning: Extra data size ({extra_size} bytes) is not a multiple of 4 bytes.")
+            self.reserved_extra = [f.readLong(unsigned) for _ in range(num_extra)]
+            print(f"Warning: Unknown size {size} bytes. Extra reserved data captured.")
+        elif size > 28:
+            self.lightmap_index = f.readShort(signed)
+
+            extra_size = size - 28
+            num_extra = extra_size // 4
+            if extra_size % 4 != 0:
+                print(f"Warning: Extra data size ({extra_size} bytes) is not a multiple of 4 bytes.")
+            self.reserved_extra = [f.readLong(unsigned) for _ in range(num_extra)]
+            print(f"Warning: Unknown size {size} bytes. Extra reserved data captured.")
+        else:
+            print(f"Error: Specified size {size} bytes is too small or unknown.")
+
+    def write(self, f, size):
+        '''Write mesh render entry data back to the file.'''
+        # Write common fields to file
+        f.writeByte(self.opacity)
+        f.writeByte(self.material_shininess)
+        f.writeByte(self.diffuse_color)
+        f.writeByte(self.opacity_detail)
+        for coord in self.position:
+            f.writeFloat(coord)
+        f.writeShort(self.face_pos)
+        f.writeShort(self.face_count)
+        f.writeShort(self.vertex_pos)
+        f.writeShort(self.vertex_count)
+        f.writeShort(self.texture_diffuse_index)
+
+        # Write additional data based on size
+        if size == 32:
+            f.writeShort(self.texture_bump_index)
+            f.writeShort(self.texture_reflection_index)
+            f.writeByte(self.texture_reflection_detail)
+            f.writeByte(self.texture_bump_detail)
+        elif size == 28:
+            f.writeShort(self.lightmap_index)
+
+        # Write reserved extra data if present
+        if self.reserved_extra:
+            for data in self.reserved_extra:
+                f.writeLong(data)
+
+
+class MecoMeshRend_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''MecoMeshRendEntry_t[]''' 
+        self.entry = []
+        # -----------------------------------------------------------
+
+    def read(self, f, model_type, size):
+        '''Read the mesh render data from the file.'''
+        self.entry = []
+
+        if model_type is not None:
+            stride = 32
+            if model_type == 3:
+                stride = 28
+            
+            count = int(size / stride)
+            if count > 0:
+                for _ in range(count):
+                    entry = MecoMeshRendEntry_t()
+                    entry.read(f, stride)  # Use the stride for reading
+                    self.entry.append(entry)
+
+    def write(self, f):
+        '''Write the mesh render data back to the file.'''
+        for entry in self.entry:
+            entry.write(f, 32)  # Here you could pass the actual size if needed
+
+    def __str__(self):
+        # Print all entries in a well-formatted way
+        return "\n".join(str(entry) for entry in self.entry)
+
+
+class MecoMeshVrtxEntry_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''float'''    # Position
+        self.position = [0.0, 0.0, 0.0]  
+        # -----------------------------------------------------------
+        '''float'''    # Texture Coordinate U
+        self.texcoord0 = [0.0, 0.0]     
+        # -----------------------------------------------------------
+        '''float'''    # Normal X (optional)
+        self.normal = [0.0, 0.0, 0.0]   
+        # -----------------------------------------------------------
+        '''float'''    # Weight (optional)
+        self.weight = 0.0                
+        # -----------------------------------------------------------
+        '''float'''    # Additional Texture Coordinate (optional)
+        self.texcoord1 = [0.0, 0.0]      
+        # -----------------------------------------------------------
+        '''uint16_t''' # Vertex Normal Index (optional)
+        self.vertex_index = 0            
+        # -----------------------------------------------------------
+        '''uint16_t''' # Bone Normal Index (optional)
+        self.bone_index = 0              
+        # -----------------------------------------------------------
+
+    def read(self, f, model_type):
+        # Read Common Fields
+        self.position = [f.readFloat(), f.readFloat(), f.readFloat()]
+
+        if model_type < 3:
+            self.normal = [f.readFloat(), f.readFloat(), f.readFloat()]
+
+        self.texcoord0 = [f.readFloat(), f.readFloat()]
+
+        if model_type > 1:
+            self.texcoord1 = [f.readFloat(), f.readFloat()]
+
+        if model_type == 1:
+            self.weight = f.readFloat()
+            self.vertex_index = f.readShort(unsigned)
+            self.bone_index = f.readShort(unsigned)
+
+    def write(self, f, model_type):
+        # Write Common Fields
+        for coord in self.position:
+            f.writeFloat(coord)
+
+        if model_type < 3:
+            for coord in self.normal:
+                f.writeFloat(coord)
+
+        for coord in self.texcoord0:
+            f.writeFloat(coord)
+
+        if model_type > 1:
+            for coord in self.texcoord1:
+                f.writeFloat(coord)
+
+        if model_type == 1:
+            f.writeFloat(self.weight)
+            f.writeShort(self.vertex_index, unsigned)
+            f.writeShort(self.bone_index, unsigned)
+
+
+class MecoMeshVrtx_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''MecoMeshVrtxEntry_t[]''' # Array of Vertex Entries
+        self.entry = []  
+        # -----------------------------------------------------------
+
+    def read(self, f, count, model_type):
+        self.entry = []
+        if count is not None and count > 0:
+            for i in range(count):
+                entry = MecoMeshVrtxEntry_t()
+                entry.read(f, model_type)
+                self.entry.append(entry)
+
+    def write(self, f):
+        # Write each vertex entry to the file
+        for entry in self.entry:
+            entry.write(f, entry.model_type)  # Assuming model_type is available in entry
+
+
+class MecoMeshCSphEntry_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''float[3]''' # position
+        self.position = [0.0, 0.0, 0.0]  
+        # -----------------------------------------------------------
+        '''float'''    # radius
+        self.radius = 0.0  
+        # -----------------------------------------------------------
+        '''uint16_t''' 
+        self.unk72 = 0
+        # -----------------------------------------------------------
+        '''uint16_t''' 
+        self.unk73 = 0
+        # -----------------------------------------------------------
+        '''uint16_t''' 
+        self.unk74 = 0
+        # -----------------------------------------------------------
+        '''uint16_t''' 
+        self.unk75 = 0
+        # -----------------------------------------------------------
+
+    def read(self, f):
+        self.position = [f.readFloat(), f.readFloat(), f.readFloat()]
+        self.radius = f.readFloat()
+        self.unk72 = f.readShort(unsigned)
+        self.unk73 = f.readShort(unsigned)
+        self.unk74 = f.readShort(unsigned)
+        self.unk75 = f.readShort(unsigned)
+
+    def write(self, f):
+        for coord in self.position:
+            f.writeFloat(coord)
+        f.writeFloat(self.radius)
+        f.writeShort(self.unk72, unsigned)
+        f.writeShort(self.unk73, unsigned)
+        f.writeShort(self.unk74, unsigned)
+        f.writeShort(self.unk75, unsigned)
+
+    def __str__(self):
+        return f'MecoMeshCSphEntry_t(position={self.position}, radius={self.radius}, unk72={self.unk72}, unk73={self.unk73}, unk74={self.unk74}, unk75={self.unk75})'
+
+
+class MecoMeshCSph_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''MecoMeshCSphEntry_t[]''' 
+        self.entry = []
+        # -----------------------------------------------------------
+
+    def read(self, f, count=None):
+        self.entry = []
+        if count is not None and count > 0:
+            for _ in range(count):
+                sph_entry = MecoMeshCSphEntry_t()
+                sph_entry.read(f)
+                self.entry.append(sph_entry)
+
+    def write(self, f):
+        count = len(self.entry)
+        for sph_entry in self.entry:
+            sph_entry.write(f)
+
+    def __str__(self):
+        return f'MecoMeshCSph_t(entry=[{", ".join(str(e) for e in self.entry)}])'
+
+
+class MecoMeshCVtxEntry_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''float[3]''' # position
+        self.position = [0.0, 0.0, 0.0]  
+        # -----------------------------------------------------------
+        '''uint32_t''' # bone assignment?
+        self.bone_index = 0  
+        # -----------------------------------------------------------
+        '''uint32_t''' # 0 ?
+        self.unk78 = 0  
+        # -----------------------------------------------------------
+
+    def read(self, f):
+        self.position = [f.readFloat(), f.readFloat(), f.readFloat()]
+        self.bone_index = f.readLong(unsigned)
+        self.unk78 = f.readLong(unsigned)
+
+    def write(self, f):
+        for coord in self.position:
+            f.writeFloat(coord)
+        f.writeLong(self.bone_index, unsigned)
+        f.writeLong(self.unk78, unsigned)
+
+    def __str__(self):
+        return f'MecoMeshCVtxEntry_t(position={self.position}, bone_index={self.bone_index}, unk78={self.unk78})'
+
+
+class MecoMeshCVtx_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''MecoMeshCVtxEntry_t[]''' 
+        self.entry = []
+        # -----------------------------------------------------------
+
+    def read(self, f, count=None):
+        self.entry = []
+        if count is not None and count > 0:
+            for _ in range(count):
+                vtx_entry = MecoMeshCVtxEntry_t()
+                vtx_entry.read(f)
+                self.entry.append(vtx_entry)
+
+    def write(self, f):
+        count = len(self.entry)
+        for vtx_entry in self.entry:
+            vtx_entry.write(f)
+
+    def __str__(self):
+        return f'MecoMeshCVtx_t(entry=[{", ".join(str(e) for e in self.entry)}])'
+
+
+class MecoMeshCFceEntry_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''uint16_t[3]''' # face
+        self.face = [0, 0, 0]  
+        # -----------------------------------------------------------
+        '''uint16_t''' # index?
+        self.material_index = 0  
+        # -----------------------------------------------------------
+        '''uint16_t''' # -1
+        self.unk80 = 0  
+        # -----------------------------------------------------------
+        '''uint16_t''' # 0
+        self.unk81 = 0  
+        # -----------------------------------------------------------
+
+    def read(self, f):
+        self.face = [f.readShort(unsigned), f.readShort(unsigned), f.readShort(unsigned)]
+        self.material_index = f.readShort(signed)
+        self.unk80 = f.readShort(signed)
+        self.unk81 = f.readShort(signed)
+
+    def write(self, f):
+        for index in self.face:
+            f.writeShort(index, unsigned)
+        f.writeShort(self.material_index, signed)
+        f.writeShort(self.unk80, signed)
+        f.writeShort(self.unk81, signed)
+
+    def __str__(self):
+        return f'MecoMeshCFceEntry_t(face={self.face}, material_index={self.material_index}, unk80={self.unk80}, unk81={self.unk81})'
+
+
+class MecoMeshCFce_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''MecoMeshCFceEntry_t[]''' 
+        self.entry = []
+        # -----------------------------------------------------------
+
+    def read(self, f, count=None):
+        self.entry = []
+        if count is not None and count > 0:
+            for _ in range(count):
+                fce_entry = MecoMeshCFceEntry_t()
+                fce_entry.read(f)
+                self.entry.append(fce_entry)
+
+    def write(self, f):
+        count = len(self.entry)
+        for fce_entry in self.entry:
+            fce_entry.write(f)
+
+    def __str__(self):
+        return f'MecoMeshCFce_t(entry=[{", ".join(str(e) for e in self.entry)}])'
+
+
+class MecoMeshCMshEntry_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''uint32_t''' # faces
+        self.num_faces = 0  
+        # -----------------------------------------------------------
+        '''uint32_t''' # vertices
+        self.num_vertices = 0  
+        # -----------------------------------------------------------
+        '''uint32_t''' # materials
+        self.num_materials = 0  
+        # -----------------------------------------------------------
+        '''uint32_t''' # spheres
+        self.num_spheres = 0  
+        # -----------------------------------------------------------
+        '''uint32_t[4]''' # Reserved field, possibly unused
+        self.reserved = [0, 0, 0, 0]  
+        # -----------------------------------------------------------
+
+    def read(self, f):
+        self.num_faces = f.readLong(unsigned)
+        self.num_vertices = f.readLong(unsigned)
+        self.num_materials = f.readLong(unsigned)
+        self.num_spheres = f.readLong(unsigned)
+        self.reserved = [f.readLong(unsigned) for _ in range(4)]
+
+    def write(self, f):
+        f.writeLong(self.num_faces, unsigned)
+        f.writeLong(self.num_vertices, unsigned)
+        f.writeLong(self.num_materials, unsigned)
+        f.writeLong(self.num_spheres, unsigned)
+        for value in self.reserved:
+            f.writeLong(value, unsigned)
+
+    def __str__(self):
+        return f'MecoMeshCMshEntry_t(num_faces={self.num_faces}, num_vertices={self.num_vertices}, num_materials={self.num_materials}, num_spheres={self.num_spheres}, reserved={self.reserved})'
+
+
+class MecoMeshCMsh_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''MecoMeshCMshEntry_t[]''' 
+        self.entry = []
+        # -----------------------------------------------------------
+
+    def read(self, f, count=None):
+        self.entry = []
+        if count is not None and count > 0:
+            for _ in range(count):
+                msh_entry = MecoMeshCMshEntry_t()
+                msh_entry.read(f)
+                self.entry.append(msh_entry)
+
+    def write(self, f):
+        count = len(self.entry)
+        for msh_entry in self.entry:
+            msh_entry.write(f)
+
+    def __str__(self):
+        return f'MecoMeshCMsh_t(entry=[{", ".join(str(e) for e in self.entry)}])'
+
+
+class MecoMeshCMatEntry_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''uint32_t''' 
+        self.unk48 = 0
+        # -----------------------------------------------------------
+        '''int16_t'''  
+        self.unk49 = 0
+        # -----------------------------------------------------------
+        '''uint16_t''' 
+        self.unk50 = 0
+        # -----------------------------------------------------------
+        '''uint32_t''' 
+        self.unk51 = 0
+        # -----------------------------------------------------------
+        '''uint32_t''' 
+        self.unk52 = 0
+        # -----------------------------------------------------------
+
+    def read(self, f):
+        self.unk48 = f.readLong(unsigned)
+        self.unk49 = f.readShort(signed)
+        self.unk50 = f.readShort(unsigned)
+        self.unk51 = f.readLong(unsigned)
+        self.unk52 = f.readLong(unsigned)
+
+    def write(self, f):
+        f.writeLong(self.unk48, unsigned)
+        f.writeShort(self.unk49, signed)
+        f.writeShort(self.unk50, unsigned)
+        f.writeLong(self.unk51, unsigned)
+        f.writeLong(self.unk52, unsigned)
+
+    def __str__(self):
+        return (f'MecoMeshCMatEntry_t(unk48={self.unk48}, unk49={self.unk49}, '
+                f'unk50={self.unk50}, unk51={self.unk51}, unk52={self.unk52})')
+
+
+class MecoMeshCMat_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''MecoMeshCMatEntry_t[]''' 
+        self.entry = []
+        # -----------------------------------------------------------
+
+    def read(self, f, count=None):
+        self.entry = []
+        if count is not None and count > 0:
+            for _ in range(count):
+                mat_entry = MecoMeshCMatEntry_t()
+                mat_entry.read(f)
+                self.entry.append(mat_entry)
+
+    def write(self, f):
+        count = len(self.entry)
+        for mat_entry in self.entry:
+            mat_entry.write(f)
+
+    def __str__(self):
+        return f'MecoMeshCMat_t(entry=[{", ".join(str(e) for e in self.entry)}])'
+
+
+class MecoMeshMrphEntry_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''uint32_t''' 
+        self.index = 0
+        # -----------------------------------------------------------
+        '''float[3]''' 
+        self.delta = [0.0, 0.0, 0.0]
+        # -----------------------------------------------------------
+
+    def read(self, f):
+        self.index = f.readLong(unsigned)
+        self.delta = [f.readFloat(), f.readFloat(), f.readFloat()]
+
+    def write(self, f):
+        f.writeLong(self.index, unsigned)
+        for value in self.delta:
+            f.writeFloat(value)
+
+    def __str__(self):
+        return f'MecoMeshMrphEntry_t(index={self.index}, delta={self.delta})'
+
+
+class MecoMeshMrph_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''MecoMeshMrphEntry_t[][]''' 
+        self.entry = []
+        # -----------------------------------------------------------
+
+    def read(self, f):
+        counts = []
+        for _ in range(16):
+            counts.append(f.readLong(unsigned))
+
+        self.entry = []
+        if len(counts) > 0:
+            self.entry = [[] for _ in range(len(counts))]  # Initialize list of lists
+
+            for i in range(len(counts)):
+                if counts[i] > 0:
+                    arr = []
+                    for _ in range(counts[i]):
+                        mrph_entry = MecoMeshMrphEntry_t()
+                        mrph_entry.read(f)
+                        arr.append(mrph_entry)
+                    self.entry[i] = arr
+
+    def write(self, f):
+        for count in self.entry:
+            f.writeLong(len(count), unsigned)  # Write the count for each entry
+            for entry in count:
+                entry.write(f)
+
+    def __str__(self):
+        return f'MecoMeshMrph_t(entry=[{", ".join(str(e) for e in self.entry)}])'
+
+
+class MecoMeshChunk_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''uint32_t''' 
+        self.type = 0
+        # -----------------------------------------------------------
+        '''uint32_t''' # 0 if no data
+        self.data = 0  
+        # -----------------------------------------------------------
+        '''uint32_t''' # always 4?
+        self.flag = 0  
+        # -----------------------------------------------------------
+        '''uint32_t''' # default
+        self.size = 0  
+        # -----------------------------------------------------------
+        # Placeholder for the resource
+        self.res = None  
+        # -----------------------------------------------------------
+        '''string''' 
+        self.type_debug = ""
+        # -----------------------------------------------------------
+    
+    def read(self, f, header=MecoMesh_t(), render3D=MecoMeshRD3D_t(), verbose=False, stopOnNewChunk=False):
+        pos = f.tell()
+        self.type = f.readLong(unsigned)
+        self.data = f.readLong(unsigned)  # Size of data following this 16-byte subheader
+        self.flag = f.readLong(unsigned)  # Always 4?
+        self.size = f.readLong(unsigned)  # Header size + data size
+
+        # Extract characters for type_debug in correct order
+        self.type_debug = ''.join([chr((self.type >> (8 * (3 - i))) & 0xFF) for i in range(4)])
+
+        if verbose:
+            print(f"Chunk {{ {self.type_debug} }} @ {pos}")
+
+        if self.data > 0:
+            # Handle each type case
+            if self.type == 0x4D455348:  # MESH
+                header.read(f)
+                self.res = header
+                print(self.res)
+                if verbose:
+                    print(f"{self.type_debug}\n{self.res}\n----------------------------")
+
+
+            elif self.type == 0x41545441:  # ATTA
+                count = self.data // 72
+                self.res = MecoMeshAtta_t()
+                self.res.read(f, count)
+                if verbose:
+                    print(f"{self.type_debug}: Count# \t{count}\t\n{self.res}\n----------------------------")
+
+            elif self.type == 0x4D565458:  # MVTX
+                count = self.data // 16
+                self.res = MecoMeshMVtx_t()
+                self.res.read(f, count)
+                if verbose:
+                    print(f"{self.type_debug}: Count# \t{count}\t\n{self.res}\n----------------------------")
+
+            elif self.type == 0x52443344:  # RD3D
+                render3D.read(f, self.data)
+                self.res = render3D
+                if verbose:
+                    print(f"{self.type_debug}: Size# \t{self.data}\t\n{self.res}\n----------------------------")
+
+            elif self.type == 0x48494552:  # HIER
+                self.res = MecoMeshHier_t()
+                self.res.read(f, header.num_bones)
+                if verbose:
+                    print(f"{self.type_debug}: Count# \t{header.num_bones}\t\n{self.res}\n----------------------------")
+
+            elif self.type == 0x424E414D:  # BNAM
+                count = self.data // 16
+                self.res = MecoMeshBNam_t()
+                self.res.read(f, header.num_bones)
+                if verbose:
+                    print(f"BNAME Count (Guess): \t{count} (header:{header.num_bones})\n")
+                    print(f"{self.type_debug}: Count# \t{header.num_bones}\t\n{self.res}\n----------------------------")
+
+            elif self.type == 0x46414345:  # FACE
+                self.res = MecoMeshFace_t()
+                count = header.sum_c_faces
+                if count == 0:
+                    count = self.data // 6
+                self.res.read(f, count)
+                if verbose:
+                    print(f"{self.type_debug}: Count# \t{header.sum_c_faces}\t\n{self.res}\n----------------------------")
+
+            elif self.type == 0x52454E44:  # REND
+                self.res = MecoMeshRend_t()
+                self.res.read(f, header.model_type, self.data)
+                if verbose:
+                    print(f"{self.type_debug}: Count# \t{self.res.entry.count}\t\n{self.res}\n----------------------------")
+
+            elif self.type == 0x56525458:  # VRTX
+                # This stride may change; the actual count comes from RD3D
+                stride = 32 if header.model_type == 0 else 40
+                count = self.data // stride
+                if verbose:
+                    print(f"Stride: \t{stride}\n")
+                self.res = MecoMeshVrtx_t()
+                self.res.read(f, count, header.model_type)
+                if verbose:
+                    print(f"{self.type_debug}: Count# \t{count}\t\n{self.res}\n----------------------------")
+
+            elif self.type == 0x43565458:  # CVTX
+                stride = 0
+                count = 0
+                if header.sum_c_verts > 0:
+                    stride = self.data // header.sum_c_verts
+                    count = self.data // stride
+                self.res = MecoMeshCVtx_t()
+                self.res.read(f, count)
+                if verbose:
+                    print(f"{self.type_debug}: Count# \t{count}, stride: \t{stride} \t\n{self.res}\n----------------------------")
+
+            elif self.type == 0x43464345:  # CFCE
+                stride = 0
+                count = 0
+                if header.sum_c_faces > 0:
+                    stride = self.data // header.sum_c_faces
+                    count = self.data // stride
+                self.res = MecoMeshCFce_t()
+                self.res.read(f, count)
+                if verbose:
+                    print(f"{self.type_debug}: Count# \t{count}, stride: \t{stride} \t\n{self.res}\n----------------------------")
+
+            elif self.type == 0x434D4154:  # CMAT
+                count = self.data // 32
+                self.res = MecoMeshCMat_t()
+                self.res.read(f, count)
+                if verbose:
+                    print(f"{self.type_debug}: Count# \t{count}\t\n{self.res}\n----------------------------")
+
+            elif self.type == 0x43535048:  # CSPH
+                count = self.data // 24
+                self.res = MecoMeshCSph_t()
+                self.res.read(f, count)
+                if verbose:
+                    print(f"{self.type_debug}: Count# \t{count}\t\n{self.res}\n----------------------------")
+
+            elif self.type == 0x4D525048:  # MRPH
+                self.res = MecoMeshMrph_t()
+                self.res.read(f)
+                if verbose:
+                    print(f"{self.type_debug}\n{self.res}\n----------------------------")
+
+            elif self.type == 0x434D5348:  # CMSH
+                count = self.data // 64
+                self.res = MecoMeshCMsh_t()
+                self.res.read(f, count)
+                if verbose:
+                    print(f"{self.type_debug}: Count# \t{count}\t\n{self.res}\n----------------------------")
+
+            else:
+                print(f"Unexpected Chunk {{{self.type_debug}}} @ {pos}, Parsing Halted.")
+                if stopOnNewChunk:
+                    return False, header, render3D
+
+        padding = (4 - (self.data % 4)) % 4  # Calculate padding
+        f.seek(pos + 16 + self.data + padding)  # Jump to end
+        
+        return True, header, render3D
+
+    def __str__(self):
+        return f'MecoMeshChunk_t(type={self.type}, data={self.data}, flag={self.flag}, size={self.size}, type_debug={self.type_debug})'
+
+
+class MecoFile_t:
+    def __init__(self):
+        # -----------------------------------------------------------
+        '''uint32_t''' # 0x46464C49 = 'ILFF' InnerLoop File Format
+        self.file_type = 1179012169 
+        # -----------------------------------------------------------
+        '''uint32_t''' # entire file size
+        self.file_size = 0  
+        # -----------------------------------------------------------
+        '''uint32_t''' # 4
+        self.file_unk1 = 4  
+        # -----------------------------------------------------------
+        '''uint32_t''' # 0
+        self.file_unk2 = 0  
+        # -----------------------------------------------------------
+        '''uint32_t''' # 0x4D45434F = 'MECO' MEF = Mesh Exporter File
+        self.content_type = 1296384847 
+        # -----------------------------------------------------------
+        # Placeholder for content
+        self.content = []  
+        # -----------------------------------------------------------
+
+    def get_content(self, block_name):
+        data = None
+        for c in self.content:
+            if c.type_debug.lower() == block_name.lower():
+                data = c.res
+                break
+        return data
+
+    def read(self, f, mscale=0.0254, importToScene=True):
+        result = False
+        if f is not None:
+            file_pos = f.tell()
+            self.file_type = f.readLong(unsigned)
+            if self.file_type == 0x46464C49:  # FFLI
+                self.file_size = f.readLong(unsigned)  # entire file size
+                self.file_unk1 = f.readLong(unsigned)  # 4
+                self.file_unk2 = f.readLong(unsigned)  # 0
+                file_end = file_pos + self.file_size
+
+                if f.tell() < file_end:
+                    mHeader = MecoMesh_t()
+                    mRender3D = MecoMeshRD3D_t()
+                    self.content_type = f.readLong(unsigned)
+                    if self.content_type == 0x4D45434F:  # MECO
+                        while f.tell() < file_end:
+                            chunk = MecoMeshChunk_t()
+                            result, hdr, r3d = chunk.read(f, header=mHeader, render3D=mRender3D)
+                            if hdr != None:
+                                mHeader = hdr
+                            if r3d != None:
+                                mRender3D = r3d
+                            if not result:
+                                break
+                            self.content.append(chunk)
+
+                        if f.tell() == file_end:
+                            print("Done")
+                        else:
+                            print(f"End at {f.tell()}")
+                        result = True
+                        if importToScene == True:
+                            self.build(mHeader=mHeader, mscale=mscale)
+                    else:
+                        print("Unsupported Content Type")
+            else:
+                print("Invalid File Header")
+        else:
+            print("Failed to read file")
+        return result
+
+
+    def build(self, mHeader, mscale=0.0254):
+        delete_all()  # Ensure the scene is clean before starting
+
+        # Create the armature and enter edit mode
+        boneArray = boneSys(armatureName="Skeleton")
+        
+        
+
+        hier = self.get_content("HIER")  # Retrieve hierarchy data
+        bnam = self.get_content("BNAM")  # Retrieve bone names
+        
+        bone_positions = []
+        
+        # Check if the required data is available
+        if mHeader.num_bones > 0 and hier is not None and bnam is not None:
+            parentArray = [-1] * mHeader.num_bones  # Initialize parent indices with -1
+
+            # Initialize bone child mapping array
+            boneChildren = [[] for _ in range(mHeader.num_bones)]
+
+            # Calculate parent-child relationships
+            currentIndex = 1  # Start indexing from 1 to match the 1-based index system
+            for i in range(mHeader.num_bones):
+                numChildren = hier.num_children[i]
+                for j in range(numChildren):
+                    if currentIndex < mHeader.num_bones:
+                        boneChildren[i].append(currentIndex)
+                        currentIndex += 1
+
+            # Assign parents based on the child mapping
+            def assign_parent(bone_index, parent_array, bone_children):
+                children = bone_children[bone_index]
+                for child_index in children:
+                    parent_array[child_index] = bone_index
+                    assign_parent(child_index, parent_array, bone_children)
+
+            # Start recursive parent assignment from the root bone
+            assign_parent(0, parentArray, boneChildren)
+
+            # Create bones in the armature
+            for i in range(mHeader.num_bones):
+                bone_name = bnam.names[i]
+                head_pos = [coord * mscale for coord in hier.position[i]]
+                tail_pos = [head_pos[0], head_pos[1] + 0.1 * mscale, head_pos[2]]  # Create a small offset for visibility
+                boneArray.createBone(boneName=bone_name, startPos=head_pos, endPos=tail_pos)
+            # >>>>>>>>>>>>>>>>>>>>>>>>>> B O N E  E D I T  M O D E  O P E N E D >>>>>>>>>>>>>>>>>>>>>>>>>> #
+            boneArray.editMode(True)
+            
+            # Set bone parents
+            print (parentArray)
+            for i in range(mHeader.num_bones):
+                child_bone_name = bnam.names[i]
+                local_bone_pos = boneArray.getPosition(child_bone_name)
+                if parentArray[i] > -1:
+                    
+                    parent_bone_name = bnam.names[parentArray[i]]
+                    
+                    local_parent_pos = boneArray.getPosition(parent_bone_name)
+                    new_pos = [
+                        (local_bone_pos[0] + local_parent_pos[0]),
+                        (local_bone_pos[1] + local_parent_pos[1]),
+                        (local_bone_pos[2] + local_parent_pos[2]),
+                        ]
+                    boneArray.setPosition(child_bone_name, new_pos)
+                    boneArray.setParent(child_bone_name, parent_bone_name)
+                    bone_positions.append(new_pos)
+                else:
+                    bone_positions.append(local_bone_pos)
+            boneArray.rebuildEndPositions(mscale=mscale)
+            boneArray.editMode(False)  # Exit edit mode after making all changes
+            
+            # <<<<<<<<<<<<<<<<<<<<<<<<<< B O N E  E D I T  M O D E  C L O S E D <<<<<<<<<<<<<<<<<<<<<<<<<< #
+            
+            
+
+        # Build Attachments as empties and parent to bones
+        atta = self.get_content("ATTA")  # MecoMeshAtta_t
+        if atta is not None:
+            for attachment in atta.entry:
+                empty = bpy.data.objects.new("Empty", None)
+                bpy.context.collection.objects.link(empty)
+                empty.location = [attachment.unk42[0][i] * mscale for i in range(3)]
+                empty.name = attachment.name
+                if attachment.bone_index < mHeader.num_bones:
+                    empty.parent = boneArray.armature
+                    empty.parent_type = 'BONE'
+                    empty.parent_bone = bnam.names[attachment.bone_index]
+
+
+        # Build Mesh
+        vrtx = self.get_content("VRTX")  # MecoMeshVrtx_t
+        face = self.get_content("FACE")  # MecoMeshFace_t
+        rend = self.get_content("REND")  # MecoMeshRend_t
+        mrph = self.get_content("MRPH")  # MecoMeshMrph_t
+
+        if vrtx is not None and face is not None and rend is not None and len(rend.entry) > 0:
+            vert_off = 0
+            mat = MultiMaterial(numsubs=len(rend.entry))
+            mshArray = []
+            for smesh_index, smesh in enumerate(rend.entry):
+                # Retrieve Info from REND block
+                face_pos = int(smesh.face_pos / 3)
+                face_count = smesh.face_count
+                vert_pos = smesh.vertex_pos
+                vert_count = smesh.vertex_count
+                mat_index = smesh.texture_diffuse_index
+
+                # Copy Faces
+                faceArray = []
+                matArray = []
+                for i in range(face_pos, face_pos + face_count):
+                    
+                    if 0 <= i < len(face.entry):
+                        # Adjust indices and reverse order
+                        face_indices = [
+                            face.entry[i][0] - vert_off,
+                            face.entry[i][2] - vert_off,
+                            face.entry[i][1] - vert_off
+                        ]
+                        faceArray.append(face_indices)
+                        matArray.append(mat_index)
+                    else:
+                        break
+
+                # Collect Vertices, Normals, UVs
+                vertArray = []
+                normArray = []
+                uvw0Array = []
+                for i in range(vert_pos, vert_pos + vert_count):
+                    vertex_entry = vrtx.entry[i]
+                    node_pos = [0.0, 0.0, 0.0]
+                    if 0 <= vertex_entry.bone_index < mHeader.num_bones:
+                        bone_name = bnam.names[vertex_entry.bone_index]
+                        # Get the bone position
+                        #bone_position = boneArray.getPosition(bnam.names[vertex_entry.bone_index])
+                        node_pos = bone_positions[vertex_entry.bone_index]
+                    position = [
+                        (vertex_entry.position[0] * mscale) + node_pos[0],
+                        (vertex_entry.position[1] * mscale) + node_pos[1],
+                        (vertex_entry.position[2] * mscale) + node_pos[2]
+                    ]
+                    vertArray.append(position)
+                    uvw0Array.append((vertex_entry.texcoord0[0], vertex_entry.texcoord0[1]))
+                    normArray.append(vertex_entry.normal)
+
+                # Create Mesh
+                mesh_name = f"Mesh_{smesh_index}"
+                obj = mesh(
+                    vertices=vertArray,
+                    faces=faceArray,
+                    materialIDs=matArray,
+                    tverts=[uvw0Array],
+                    normals=normArray,
+                    materials=mat,
+                    mscale=1.0,  # Already scaled vertices
+                    flipAxis=False,
+                    obj_name=mesh_name
+                )
+
+                # Set material to object
+                if obj and mat_index < len(mat):
+                    material = mat[mat_index].data
+                    if len(obj.data.materials) < mat_index + 1:
+                        obj.data.materials.append(material)
+                    else:
+                        obj.data.materials[mat_index] = material
+
+
+                # Assign vertex groups (rigid weights)
+                if bnam != None:
+                    print(f"Assigning vertex groups for mesh '{mesh_name}'...")
+                    for bone_name in bnam.names:
+                        if bone_name not in obj.vertex_groups:
+                            obj.vertex_groups.new(name=bone_name)
+                    
+                    for v_idx, vertex_entry in enumerate(vrtx.entry[vert_pos: vert_pos + vert_count]):
+                        bone_index = vertex_entry.bone_index
+                        if 0 <= bone_index < mHeader.num_bones:
+                            bone_name = bnam.names[bone_index]
+                            vg = obj.vertex_groups.get(bone_name)
+                            if vg:
+                                vg.add([v_idx], 1.0, 'REPLACE')
+                                print(f"Assigned vertex {v_idx} to group '{bone_name}' with weight 1.0")
+                            else:
+                                print(f"Warning: Vertex group '{bone_name}' not found for vertex {v_idx}")
+                        else:
+                            print(f"Warning: Invalid bone_index {bone_index} for vertex {v_idx}")
+
+                    # Add Armature Modifier
+                    mod = obj.modifiers.new(type='ARMATURE', name='Armature')
+                    mod.object = boneArray.armature
+                    print(f"Added armature modifier to mesh '{mesh_name}'")
+
+                # Set object properties
+                obj.show_wire = False
+                obj.display_type = 'TEXTURED'
+                obj.color = (random.random(), random.random(), random.random(), 1.0)
+
+                # Add to mesh array
+                mshArray.append(obj)
+
+                # Build Morphs (Not fully implemented, placeholder)
+                if mrph is not None:
+                    pass  # Implement morph target application if needed
+
+                vert_off += vert_count
+
+ 
+
+    def __str__(self):
+        return f'MecoFile_t(file_type={self.file_type}, file_size={self.file_size}, content_type={self.content_type}, content_count={len(self.content)})'
+
+
+def import_mef_ascii(filename):
+    # Clear the scene before importing
+    delete_all()
+    
+    # Open file for reading
+    try:
+        with open(filename, 'r') as file:
+            current_object_name = ""
+            vertices = []
+            faces = []
+            face_normals = []
+            materials = []
+            face_materials = []
+            bones = []
+            bone_data_map = {}  # Map for bones data: index -> {name, position, parent_index, world_position}
+            bone_objects = []
+            vertex_weights = []
+
+            # Read file line by line
+            for line_number, line in enumerate(file, 1):  # Track line number for better debugging
+                line = line.strip()
+                # Skip empty lines or comments (start with "//")
+                if not line or line.startswith("//"):
+                    continue
+
+                # Extract keyword inside parentheses and trim
+                try:
+                    keyword, params = line.split("(", 1)
+                    keyword = keyword.strip().lower()
+                    params = params.split(")", 1)[0].strip()
+                except ValueError:
+                    print(f"Skipping malformed line {line_number}: {line}")
+                    continue  # Skip lines that don't match the pattern
+
+                # Handle various keywords
+                if keyword == "newobject":
+                    # If a previous object was read, create its mesh
+                    if current_object_name and vertices:
+                        mesh_obj = bpy.data.meshes.new(current_object_name)
+                        mesh_obj.from_pydata(vertices, [], faces)
+                        obj = bpy.data.objects.new(current_object_name, mesh_obj)
+                        bpy.context.collection.objects.link(obj)
+
+                        # Assign materials if available
+                        if materials:
+                            for mat in materials:
+                                obj.data.materials.append(mat)
+
+                        print(f"Built mesh for object: {current_object_name}")
+
+                        # Reset lists for new object
+                        vertices = []
+                        faces = []
+                        face_normals = []
+                        materials = []
+                        face_materials = []
+
+                    # Set current object name
+                    tokens = params.split(",")
+                    if len(tokens) < 1:
+                        print(f"Error parsing NewObject params on line {line_number}")
+                        continue
+
+                    current_object_name = tokens[0].strip()
+
+                elif keyword == "vertex":
+                    tokens = params.split(",")
+                    if len(tokens) < 4:
+                        print(f"Error parsing Vertex params on line {line_number}")
+                        continue
+                    x, y, z = float(tokens[1]), float(tokens[2]), float(tokens[3])
+                    vertices.append([-x, -y, z])  # Convert to correct axis
+
+                elif keyword == "face":
+                    tokens = params.split(",")
+                    if len(tokens) < 8:
+                        print(f"Error parsing Face params on line {line_number}")
+                        continue
+
+                    # Extract position indices (0-based for Blender) and reverse them to match Blender's winding order
+                    v1 = int(tokens[1])
+                    v2 = int(tokens[2])
+                    v3 = int(tokens[3])
+
+                    # Extract normal indices (if needed)
+                    n1 = int(tokens[4])
+                    n2 = int(tokens[5])
+                    n3 = int(tokens[6])
+
+                    # Material index for this face (0-based for Blender)
+                    material_id = int(tokens[7])
+
+                    faces.append([v1, v3, v2])  # Reversed order for correct winding
+                    face_materials.append(material_id)
+
+                elif keyword == "material":
+                    tokens = params.split(",")
+                    if len(tokens) < 2:
+                        print(f"Error parsing Material params on line {line_number}")
+                        continue
+                    mat_id = int(tokens[0])
+                    mat_name = tokens[1].strip()
+                    material = bpy.data.materials.new(name=mat_name)
+                    materials.append(material)
+
+                elif keyword == "bone":
+                    tokens = params.split(",")
+                    if len(tokens) < 6:
+                        print(f"Error parsing Bone params on line {line_number}")
+                        continue
+                    
+                    bone_index = int(tokens[0])
+                    bone_name = tokens[1].strip()
+                    parent_index = int(tokens[2]) if tokens[2].isdigit() else -1  # Parent index or -1 for no parent
+                    pos_x, pos_y, pos_z = float(tokens[3]), float(tokens[4]), float(tokens[5])
+                    
+                    # Store bone data for armature creation (local space initially)
+                    bone_data_map[bone_index] = {
+                        "name": bone_name,
+                        "position": [-pos_x, -pos_y, pos_z],
+                        "parent_index": parent_index,
+                        "world_position": None  # To be calculated later
+                    }
+
+            # Calculate world positions for bones
+            for bone_index, bone_data in bone_data_map.items():
+                # Initialize with local position
+                world_pos = bone_data['position']
+                
+                # Accumulate parent positions to convert to world space
+                parent_index = bone_data['parent_index']
+                while parent_index in bone_data_map:
+                    parent_data = bone_data_map[parent_index]
+                    world_pos = [
+                        world_pos[0] + parent_data['position'][0],
+                        world_pos[1] + parent_data['position'][1],
+                        world_pos[2] + parent_data['position'][2]
+                    ]
+                    parent_index = parent_data['parent_index']
+                
+                # Store calculated world position
+                bone_data_map[bone_index]['world_position'] = world_pos
+
+            # Final object creation if there's remaining data
+            if current_object_name and vertices:
+                mesh_obj = bpy.data.meshes.new(current_object_name)
+                mesh_obj.from_pydata(vertices, [], faces)
+                obj = bpy.data.objects.new(current_object_name, mesh_obj)
+                bpy.context.collection.objects.link(obj)
+
+                # Assign materials to object
+                if materials:
+                    for mat in materials:
+                        obj.data.materials.append(mat)
+
+                print(f"Built mesh for object: {current_object_name}")
+
+            # Build the armature
+            if bone_data_map:
+                bpy.ops.object.armature_add(enter_editmode=True)
+                armature = bpy.context.object
+                armature.name = "Armature"
+
+                # Enter edit mode to add bones
+                bpy.ops.object.mode_set(mode='EDIT')
+                
+                # Create bones
+                for bone_index, bone_data in bone_data_map.items():
+                    bone = armature.data.edit_bones.new(bone_data['name'])
+                    bone.head = bone_data['world_position']
+                    bone.tail = [bone.head[0], bone.head[1] + 0.1, bone.head[2]]  # Small offset for bone length
+                    
+                    # Set parent if parent index exists
+                    if bone_data['parent_index'] in bone_data_map:
+                        parent_bone_name = bone_data_map[bone_data['parent_index']]['name']
+                        bone.parent = armature.data.edit_bones.get(parent_bone_name)
+                
+                # Exit edit mode after adding bones
+                bpy.ops.object.mode_set(mode='OBJECT')
+                
+                print("Built armature for bones.")
+
+            print("MEF ASCII import completed.")
+
+    except Exception as e:
+        print(f"Error while importing MEF ASCII: {e}")
+
+
+def import_mef(filepath, mscale):
+    mef_file = MecoFile_t()
+    
+    f = fopen(filepath, "rb")
+    if f != None:
+        if not mef_file.read(f, mscale=mscale):
+            import_mef_ascii(filepath)
+        fclose(f)
+
+class ImportMEF(bpy.types.Operator):
+    bl_idname = "import_mesh.mef"
+    bl_label = "Import MEF"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filepath: bpy.props.StringProperty(subtype='FILE_PATH')
+    mscale: bpy.props.FloatProperty(name="Import Scale", default=0.0254, min=0.0)
+
+    def execute(self, context):
+        import_mef(self.filepath, self.mscale)
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+
+def menu_func_import(self, context):
+    self.layout.operator(ImportMEF.bl_idname, text="Import MEF")
+
+
+def register():
+    bpy.utils.register_class(ImportMEF)
+    bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
+
+
+def unregister():
+    bpy.utils.unregister_class(ImportMEF)
+    bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
+
+
+if __name__ == "__main__":
+    if RUN_AS_ADDON:
+        register()
+    else:
+        # For testing purposes, specify a fixed file path
+        fixed_file_path = "G:\\tmp\\rando_mef_files\\jones_1.mef"
+        fixed_file_path = "G:\\tmp\\rando_mef_files\\helmet.mef"
+        fixed_file_path = "G:\\tmp\\rando_mef_files\\New folder\\Converted\\Bone Models\\jones_1.MEF"
+        import_mef(fixed_file_path, mscale=0.0002)
